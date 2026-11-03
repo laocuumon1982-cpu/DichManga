@@ -1,0 +1,181 @@
+name: Build & Release
+
+# - Đẩy code lên main  -> kiểm tra giao diện (chụp ảnh) nhanh trên Linux
+# - Đẩy tag v*         -> build DichTruyenTranh.exe + bản Portable (CPU & GPU) trên Windows
+#                         và đăng lên GitHub Releases (kèm gói cập nhật nhanh cho nút "Cập nhật")
+# Kết quả kiểm tra (log, ảnh chụp) được ghi vào nhánh ci-status.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      build:
+        description: "Build bản portable (không đăng release)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ui-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Cài thư viện giao diện
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 fonts-noto-color-emoji fonts-noto-core > /dev/null
+          pip install -q PySide6 numpy opencv-python-headless pillow requests pymupdf
+      - name: Kiểm tra cú pháp + chụp giao diện
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          mkdir -p report
+          python -m compileall -q main.py core ui tools prefetch_models.py 2>&1 | tee report/compile.log
+          python tools/make_demo.py demo_build
+          timeout 120 python main.py --screenshot report/ui_linux.png --demo demo_build/demo 2>&1 | tee report/ui_linux.log
+          test -f report/ui_linux.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-ui
+          path: report
+          retention-days: 7
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.build)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: CPU
+            torch: cpu
+          - variant: GPU
+            torch: cu128
+    steps:
+      - uses: actions/checkout@v4
+      - name: Đọc phiên bản
+        id: ver
+        shell: pwsh
+        run: |
+          $v = ([regex]::Match((Get-Content core/__init__.py -Raw), 'APP_VERSION\s*=\s*"([^"]+)"')).Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "name=DichTruyenTranh_v${v}_Portable_${{ matrix.variant }}" >> $env:GITHUB_OUTPUT
+      - name: Build bản Portable (${{ matrix.variant }})
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force report | Out-Null
+          $out = Join-Path $env:RUNNER_TEMP "${{ steps.ver.outputs.name }}"
+          ./tools/build_portable.ps1 -Torch ${{ matrix.torch }} -Prefetch none -NoPause -Out $out *>&1 | Tee-Object -FilePath report/build_${{ matrix.variant }}.log
+          if (-not (Test-Path "$out\DichTruyenTranh.exe")) { Write-Error "Không tạo được DichTruyenTranh.exe"; exit 1 }
+          "OUT=$out" >> $env:GITHUB_ENV
+      - name: Chạy thử app (chụp màn hình)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          & "$env:OUT\python\python.exe" tools/make_demo.py demo_build
+          $p = Start-Process -FilePath "$env:OUT\python\python.exe" -ArgumentList @("`"$env:OUT\app\main.py`"", "--screenshot", "`"$PWD\report\ui_windows_${{ matrix.variant }}.png`"", "--demo", "`"$PWD\demo_build\demo`"") -RedirectStandardOutput report/run_${{ matrix.variant }}.log -RedirectStandardError report/run_${{ matrix.variant }}.err -PassThru
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Error "App không thoát sau 180s"; exit 1 }
+          Get-Content report/run_${{ matrix.variant }}.log, report/run_${{ matrix.variant }}.err
+          if (-not (Test-Path "report/ui_windows_${{ matrix.variant }}.png")) { Write-Error "App không chạy được"; exit 1 }
+          & "$env:OUT\python\python.exe" -c "import sys; sys.path.insert(0, r'$env:OUT\app'); from core.pipeline import gpu_info; print(gpu_info())" *>&1 | Tee-Object -Append report/run_${{ matrix.variant }}.log
+          Get-ChildItem $env:OUT | Format-Table Name, Length | Out-String | Tee-Object -Append report/run_${{ matrix.variant }}.log
+      - name: Nén
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          $name = "${{ steps.ver.outputs.name }}"
+          Push-Location (Split-Path $env:OUT)
+          if ("${{ matrix.variant }}" -eq "CPU") {
+            7z a -tzip -mx=5 "$env:GITHUB_WORKSPACE\pkg\$name.zip" $name | Select-Object -Last 3
+          } else {
+            # file GPU lớn (> 2 GB) -> chia thành nhiều phần 1.9 GB (giới hạn của GitHub Releases)
+            7z a -t7z -mx=5 -v1900m "$env:GITHUB_WORKSPACE\pkg\$name.7z" $name | Select-Object -Last 3
+          }
+          Pop-Location
+          Get-ChildItem pkg | Format-Table Name, Length | Out-String | Tee-Object -Append report/build_${{ matrix.variant }}.log
+          Remove-Item -Recurse -Force $env:OUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.variant }}
+          path: pkg
+          retention-days: 3
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-build-${{ matrix.variant }}
+          path: report
+          retention-days: 7
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ui-preview, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gói cập nhật nhanh (chỉ code app)
+        run: |
+          mkdir -p release
+          grep -oP 'APP_VERSION\s*=\s*"\K[^"]+' core/__init__.py > version.txt
+          find core ui -name '__pycache__' -prune -exec rm -rf {} +
+          zip -qr release/DichTruyenTranh_app_update.zip main.py prefetch_models.py requirements.txt icon.ico README.md version.txt core ui fonts
+          ls -la release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: release
+          merge-multiple: true
+      - name: Đăng GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la release
+          TAG="${GITHUB_REF_NAME}"
+          VER="$(cat version.txt)"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --notes-file RELEASE_NOTES.md --title "Dịch Truyện Tranh v${VER} by Duy Anh"
+          else
+            gh release create "$TAG" release/* --title "Dịch Truyện Tranh v${VER} by Duy Anh" --notes-file RELEASE_NOTES.md --latest
+          fi
+
+  report:
+    if: always()
+    needs: [ui-preview, build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: report-*
+          path: ci
+        continue-on-error: true
+      - name: Ghi kết quả vào nhánh ci-status
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          mkdir -p ci && cd ci
+          {
+            echo "# CI ${GITHUB_RUN_ID} – ${GITHUB_REF_NAME} – ${GITHUB_SHA::7}"
+            echo "Thời gian: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo '```json'
+            echo "$NEEDS"
+            echo '```'
+          } > STATUS.md
+          find . -name '*.log' -size +3M -exec sh -c 'tail -c 3000000 "$1" > "$1.tail" && mv "$1.tail" "$1"' _ {} \;
+          git init -q -b ci-status
+          git add -A
+          git -c user.name="ci-bot" -c user.email="ci-bot@users.noreply.github.com" commit -qm "CI ${GITHUB_RUN_ID} ${GITHUB_REF_NAME}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-status

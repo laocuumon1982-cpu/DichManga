@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+build/
+dist/
+models/
+_backup/
+app_log.txt
+demo_build/
+*.tmp

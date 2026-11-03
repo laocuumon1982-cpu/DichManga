@@ -1,0 +1,15 @@
+# PyTorch (ban GPU/CPU) duoc install.bat cai rieng truoc file nay
+PySide6>=6.6
+easyocr>=1.7.1
+manga-ocr>=0.1.14
+transformers>=4.40,<5
+sentencepiece
+sacremoses
+protobuf
+huggingface_hub
+ctranslate2>=4.4
+opencc-python-reimplemented
+pymupdf>=1.24
+numpy
+pillow>=10.1
+requests
