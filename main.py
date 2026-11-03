@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
-    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from core.loader import IMG_EXT, export_pdf, list_images, pdf_page_count  # noqa: E402
@@ -155,7 +155,7 @@ class MainWindow(QMainWindow):
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 0)
         body.setStretchFactor(2, 1)
-        body.setSizes([380, 150, 950])
+        body.setSizes([410, 180, 900])
         wrap = QWidget()
         wl = QVBoxLayout(wrap)
         wl.setContentsMargins(12, 12, 12, 8)
@@ -219,11 +219,12 @@ class MainWindow(QMainWindow):
         scroll.setObjectName("sidebar")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(350)
-        scroll.setMaximumWidth(460)
+        scroll.setMinimumWidth(390)
+        scroll.setMaximumWidth(480)
         inner = QWidget()
+        inner.setMinimumWidth(0)
         v = QVBoxLayout(inner)
-        v.setContentsMargins(0, 0, 6, 0)
+        v.setContentsMargins(0, 0, 10, 0)
         v.setSpacing(12)
 
         # --- 1. nguồn truyện ---
@@ -242,6 +243,8 @@ class MainWindow(QMainWindow):
         b_proj.clicked.connect(self.open_project)
         for b in (b_folder, b_pdf, b_proj):
             b.setMinimumHeight(62)
+            b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             row.addWidget(b)
         c.add(row)
         self.lbl_source = QLabel("Chưa chọn truyện – hoặc kéo thả vào cửa sổ")
@@ -267,6 +270,9 @@ class MainWindow(QMainWindow):
         g.addWidget(field("Thiết bị", self.cb_device), 0, 1)
         g.addWidget(field("Bộ dịch", self.cb_engine), 1, 0, 1, 2)
         c.add(g)
+        for cb in (self.cb_lang, self.cb_engine, self.cb_device):
+            cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(6)
         self.chk_fallback = QCheckBox("Câu bỏ trống → GTX dịch bù (cần mạng)")
         self.chk_fallback.setChecked(True)
         c.add(self.chk_fallback)
@@ -316,6 +322,8 @@ class MainWindow(QMainWindow):
         c.add(field("Thư mục kết quả", orow))
         self.cb_fmt = QComboBox()
         self.cb_fmt.addItems(["jpg", "png"])
+        self.cb_fmt.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_fmt.setMinimumContentsLength(4)
         self.sp_dpi = QSpinBox()
         self.sp_dpi.setRange(100, 400)
         self.sp_dpi.setSingleStep(25)
@@ -373,8 +381,8 @@ class MainWindow(QMainWindow):
 
     def _build_pages(self):
         box = QWidget()
-        box.setMinimumWidth(130)
-        box.setMaximumWidth(220)
+        box.setMinimumWidth(176)
+        box.setMaximumWidth(240)
         v = QVBoxLayout(box)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
@@ -632,7 +640,7 @@ class MainWindow(QMainWindow):
         blank.fill(Qt.transparent)
         for i in range(len(self.src_pages)):
             it = QListWidgetItem(QIcon(blank), self._page_label(i))
-            it.setSizeHint(QSize(120, thumb_size().height() + 12))
+            it.setSizeHint(QSize(150, thumb_size().height() + 14))
             self.page_list.addItem(it)
         self.page_list.blockSignals(False)
         self.lbl_pages.setText(f"TRANG ({len(self.src_pages)})" if self.src_pages else "TRANG")
@@ -647,7 +655,7 @@ class MainWindow(QMainWindow):
             self.table.setRowCount(0)
 
     def _page_label(self, i):
-        return f"Trang {i + 1}\n{'✓ đã dịch' if i in self.done_pages else '—'}"
+        return f"Trang {i + 1}\n{'✓ Đã dịch' if i in self.done_pages else 'Chưa dịch'}"
 
     def _load_thumbs(self):
         """Tạo ảnh thu nhỏ dần dần (không làm đơ giao diện khi truyện có hàng trăm trang)."""
