@@ -109,13 +109,15 @@ jobs:
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: |
           & "$env:OUT\python\python.exe" tools/make_demo.py demo_build
           $p = Start-Process -FilePath "$env:OUT\python\python.exe" -ArgumentList @("`"$env:OUT\app\main.py`"", "--screenshot", "`"$PWD\report\ui_windows_${{ matrix.variant }}.png`"", "--demo", "`"$PWD\demo_build\demo`"") -RedirectStandardOutput report/run_${{ matrix.variant }}.log -RedirectStandardError report/run_${{ matrix.variant }}.err -PassThru
           if (-not $p.WaitForExit(180000)) { $p.Kill(); Write-Error "App không thoát sau 180s"; exit 1 }
           Get-Content report/run_${{ matrix.variant }}.log, report/run_${{ matrix.variant }}.err
           if (-not (Test-Path "report/ui_windows_${{ matrix.variant }}.png")) { Write-Error "App không chạy được"; exit 1 }
-          & "$env:OUT\python\python.exe" -c "import sys; sys.path.insert(0, r'$env:OUT\app'); from core.pipeline import gpu_info; print(gpu_info())" *>&1 | Tee-Object -Append report/run_${{ matrix.variant }}.log
+          & "$env:OUT\python\python.exe" -c "import sys; sys.path.insert(0, r'$env:OUT\app'); from core.paths import setup_env; setup_env(); from core.pipeline import gpu_info; print(gpu_info())" *>&1 | Tee-Object -Append report/run_${{ matrix.variant }}.log
           Get-ChildItem $env:OUT | Format-Table Name, Length | Out-String | Tee-Object -Append report/run_${{ matrix.variant }}.log
       - name: Nén
         shell: pwsh

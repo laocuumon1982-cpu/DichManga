@@ -40,6 +40,12 @@ def setup_env() -> None:
             sys.stdout = f
         if sys.stderr is None:
             sys.stderr = f
+    # console Windows (cp1252/cp437) không in được chữ tiếng Việt -> ép UTF-8, ký tự lạ thay bằng '?'
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def easyocr_dir():
