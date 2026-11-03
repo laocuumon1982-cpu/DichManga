@@ -1,8 +1,10 @@
 name: Build & Release
 
 # - Đẩy code lên main  -> kiểm tra giao diện (chụp ảnh) nhanh trên Linux
-# - Đẩy tag v*         -> build DichTruyenTranh.exe + bản Portable (CPU & GPU) trên Windows
-#                         và đăng lên GitHub Releases (kèm gói cập nhật nhanh cho nút "Cập nhật")
+# - Nếu APP_VERSION (core/__init__.py) CHƯA có bản phát hành v<APP_VERSION>.0 -> tự build
+#   DichTruyenTranh.exe + bản Portable (CPU & GPU) trên Windows và đăng GitHub Release
+#   (tạo luôn tag), kèm gói cập nhật nhanh cho nút "Cập nhật" trong app.
+#   => Ra bản mới: tăng APP_VERSION, sửa RELEASE_NOTES.md, đẩy lên main.
 # Kết quả kiểm tra (log, ảnh chụp) được ghi vào nhánh ci-status.
 on:
   push:
@@ -23,6 +25,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.m.outputs.version }}
+      tag: ${{ steps.m.outputs.tag }}
+      release: ${{ steps.m.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oP 'APP_VERSION\s*=\s*"\K[^"]+' core/__init__.py)
+          TAG="v${VER}"; [ "$(echo "$VER" | tr -cd . | wc -c)" -lt 2 ] && TAG="v${VER}.0"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="$GITHUB_REF_NAME"; REL=true
+          elif gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then REL=false
+          else REL=true; fi
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "release=$REL" >> $GITHUB_OUTPUT
+          echo "Phiên bản $VER – tag $TAG – phát hành: $REL"
+
   ui-preview:
     runs-on: ubuntu-latest
     steps:
@@ -52,7 +76,8 @@ jobs:
           retention-days: 7
 
   build:
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.build)
+    needs: [meta]
+    if: needs.meta.outputs.release == 'true' || (github.event_name == 'workflow_dispatch' && inputs.build)
     runs-on: windows-latest
     timeout-minutes: 150
     strategy:
@@ -121,8 +146,8 @@ jobs:
           retention-days: 7
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [ui-preview, build]
+    if: needs.meta.outputs.release == 'true'
+    needs: [meta, ui-preview, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,18 +168,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la release
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ needs.meta.outputs.tag }}"
           VER="$(cat version.txt)"
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" release/* --clobber
             gh release edit "$TAG" --notes-file RELEASE_NOTES.md --title "Dịch Truyện Tranh v${VER} by Duy Anh"
           else
-            gh release create "$TAG" release/* --title "Dịch Truyện Tranh v${VER} by Duy Anh" --notes-file RELEASE_NOTES.md --latest
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Dịch Truyện Tranh v${VER} by Duy Anh" --notes-file RELEASE_NOTES.md --latest
           fi
 
   report:
     if: always()
-    needs: [ui-preview, build, release]
+    needs: [meta, ui-preview, build, release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
