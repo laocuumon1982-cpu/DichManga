@@ -1,4 +1,7 @@
 """Giao diện tối (dark) – tông màu lấy theo icon app (đỏ hồng → tím)."""
+from pathlib import Path
+
+ASSET = Path(__file__).resolve().parent.as_posix()  # thư mục chứa ảnh mũi tên / dấu tick
 
 C = {
     "bg": "#0e1120",
@@ -64,10 +67,7 @@ QLineEdit, QComboBox, QSpinBox {{
 }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {C['accent']}; }}
 QComboBox::drop-down {{ border: none; width: 24px; }}
-QComboBox::down-arrow {{
-    width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent;
-    border-top: 6px solid {C['muted']}; margin-right: 8px;
-}}
+QComboBox::down-arrow {{ image: url("{ASSET}/arrow_down.png"); width: 12px; height: 8px; margin-right: 10px; }}
 QComboBox QAbstractItemView {{
     background: {C['card2']}; border: 1px solid {C['border']}; border-radius: 8px; padding: 4px;
     selection-background-color: #3b2f6b; outline: 0;
@@ -79,7 +79,7 @@ QCheckBox::indicator {{
 }}
 QCheckBox::indicator:checked {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {C['accent2']}, stop:1 {C['accent']});
-    border-color: {C['accent']};
+    border-color: {C['accent']}; image: url("{ASSET}/check.png");
 }}
 QSlider::groove:horizontal {{ height: 6px; background: {C['input']}; border-radius: 3px; }}
 QSlider::sub-page:horizontal {{
