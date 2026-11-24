@@ -13,6 +13,9 @@ class TextBlock:
     vertical: bool = False
     text: str = ""
     translation: str = ""
+    kind: str = ""          # speech | thought | shout | narration | free | sfx (tự nhận khi vẽ chữ)
+    keep: bool = False      # giữ nguyên chữ gốc (logo, tiêu đề, SFX...) – không dịch, không xoá
+    overflow: bool = False  # chữ dịch không vừa bóng ngay cả ở cỡ nhỏ nhất
 
     @property
     def w(self) -> int:
@@ -62,10 +65,14 @@ class TextBlock:
             "vertical": self.vertical,
             "text": self.text,
             "translation": self.translation,
+            "kind": self.kind,
+            "keep": self.keep,
+            "overflow": self.overflow,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "TextBlock":
         x0, y0, x1, y1 = d["rect"]
         return cls(x0, y0, x1, y1, d.get("lines", []), d.get("vertical", False),
-                   d.get("text", ""), d.get("translation", ""))
+                   d.get("text", ""), d.get("translation", ""), d.get("kind", ""),
+                   bool(d.get("keep", False)), bool(d.get("overflow", False)))

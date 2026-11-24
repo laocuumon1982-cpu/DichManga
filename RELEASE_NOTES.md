@@ -1,4 +1,4 @@
-## Dịch Truyện Tranh v2.0 by Duy Anh
+## Dịch Truyện Tranh v2.1 by Duy Anh
 
 Dịch truyện tranh **Trung · Nhật · Anh → Tiếng Việt**, chạy trên máy (GPU NVIDIA hoặc CPU).
 
@@ -12,9 +12,16 @@ Dịch truyện tranh **Trung · Nhật · Anh → Tiếng Việt**, chạy trê
 - Mở **`DichTruyenTranh.exe`**. Lần đầu dịch app tự tải model (cần Internet).
 - `DichTruyenTranh_app_update.zip` là gói cho nút **Cập nhật** trong app – không cần tải tay.
 
-### ✨ Có gì mới
-- Đổi tên thành **Dịch Truyện Tranh**, có file chạy **DichTruyenTranh.exe**, bản Portable không cần cài Python.
-- **Giao diện mới**: tối, hiện đại, kéo thả thư mục/PDF, ảnh thu nhỏ từng trang, xem gốc–đã dịch cạnh nhau (cuộn đồng bộ), % tiến độ lớn kèm thời gian còn lại.
-- **Nút Cập nhật**: tự kiểm tra bản mới trên GitHub, cập nhật 1 chạm và khởi động lại.
-- Chữ Việt **vừa khít bóng thoại** (kể cả bóng hở viền, nền lưới chấm, ảnh JPEG nhiễu), chỉnh được cỡ chữ tối đa.
-- Dịch **tiếng Anh** bằng GTX; tiếng Trung dùng HachimiMT, tiếng Nhật dùng NLLB-200 chạy GPU.
+### ✨ Có gì mới ở v2.1
+- **🤖 AI dịch cả chương theo ngữ cảnh**: Ollama / LM Studio chạy trên máy (miễn phí), hoặc DeepSeek / Gemini / OpenAI / Claude (API key của bạn). Gom chữ cả chương, kèm bảng thuật ngữ + văn phong + ghi chú truyện → tên riêng, xưng hô thống nhất.
+- **📖 Bảng thuật ngữ** (SQLite): tên riêng cho AI; tự sửa chữ Việt sau khi dịch với mọi bộ dịch; nhập / xuất CSV.
+- **🔁 Dịch lại cả chương** không cần đọc chữ / xoá chữ lại.
+- **🧽 Xoá chữ bằng AI LaMa (manga)**: chữ trên hình / nền lưới chấm sạch, không còn nhoè.
+- **Nhận diện loại ô**: thoại, suy nghĩ, hét, dẫn truyện, chữ trên hình, SFX; tick **Giữ** để giữ nguyên chữ gốc.
+- **Tab Tình trạng**: ô chưa dịch / chữ tràn khung, bấm đúp mở đúng trang.
+- **15 font tiếng Việt** kèm sẵn có xem trước, cảnh báo font thiếu dấu.
+- **Xuất Excel lời thoại** và **PSD 3 lớp** (gốc / nền sạch / chữ dịch).
+- GTX bền hơn (thêm đường dự phòng khi Google chặn); tìm bóng thoại chính xác hơn với chữ nhỏ trong bóng to và nền lưới chấm.
+- Cài đặt lưu ở `config.json` (sửa tay được), tự nhập cài đặt cũ.
+
+Cập nhật từ v2.0: bấm **⟳ Cập nhật** trong app (tự cài thêm thư viện openpyxl, psd-tools).

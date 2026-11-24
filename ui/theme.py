@@ -59,6 +59,11 @@ QLabel#sourceInfo {{
     padding: 10px; color: {C['muted']};
 }}
 QLabel#sourceInfo[filled="true"] {{ color: {C['text']}; border-style: solid; border-color: #4c3a8a; }}
+QFrame#subCard {{ background: {C['card2']}; border: 1px solid #3b2f6b; border-radius: 10px; }}
+QLabel#fontPreview {{
+    background: #ffffff; color: #111111; border-radius: 8px; padding: 4px 10px;
+}}
+QLabel#fontPreview[warn="true"] {{ background: #3a2e10; color: #fcd34d; font-size: 12px; }}
 
 /* ---------- ô nhập ---------- */
 QLineEdit, QComboBox, QSpinBox {{

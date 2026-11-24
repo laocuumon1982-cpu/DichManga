@@ -1,7 +1,8 @@
-"""Điều phối: đọc trang -> OCR (GPU) -> dịch (local GPU / GTX) -> xoá chữ -> vẽ chữ Việt -> lưu.
+"""Điều phối: đọc trang -> OCR (GPU) -> dịch -> xoá chữ (LaMa) -> vẽ chữ Việt -> lưu.
 
-3 công đoạn chạy song song (dây chuyền): trong lúc GPU đọc chữ trang N+1, trang N đang
-được dịch và các trang trước đó đang được vẽ chữ / ghi file trên các luồng CPU.
+- Bộ dịch máy (HachimiMT / NLLB / GTX): 3 công đoạn chạy song song (dây chuyền) – trong lúc GPU
+  đọc chữ trang N+1, trang N đang được dịch và các trang trước đó đang được vẽ chữ.
+- Bộ dịch AI (LLM): đọc chữ cả chương trước, dịch một lượt theo ngữ cảnh, rồi mới vẽ chữ.
 """
 import json
 import queue
@@ -15,16 +16,28 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from .block import TextBlock
-from .loader import export_pdf, imread, imwrite, list_images, pdf_to_images
+from .exporter import write_text_export  # noqa: F401  (main.py dùng)
+from .loader import imread, imwrite, list_images, pdf_to_images
 from .typeset import clean_page, render_page
+
+MODES_LLM = "llm"
 
 
 @dataclass
 class Config:
     src_lang: str = "zh"          # zh | zh_tw | ja | en
     device: str = "auto"          # auto (ưu tiên GPU) | cuda | cpu
-    engine: str = "local:ngocdang83/HachimiMT-60-zh-vi"  # "gtx" | "local:<model Hugging Face>"
-    gtx_fallback: bool = True     # câu model local bỏ trống -> nhờ GTX dịch bù (nếu có mạng)
+    engine: str = "local:ngocdang83/HachimiMT-60-zh-vi"  # "gtx" | "llm" | "local:<model Hugging Face>"
+    gtx_fallback: bool = True     # câu model local / AI bỏ trống -> nhờ GTX dịch bù (nếu có mạng)
+    use_lama: bool = True         # xoá chữ trên hình bằng AI LaMa (không thì OpenCV)
+    use_glossary: bool = True     # dùng bảng thuật ngữ
+    llm_provider: str = "ollama"  # xem core/llm.py PROVIDERS (API key KHÔNG lưu ở đây)
+    llm_url: str = ""
+    llm_model: str = ""
+    llm_style: str = ""
+    llm_notes: str = ""
+    export_xlsx: bool = True      # xuất Excel lời thoại
+    export_psd: bool = False      # xuất PSD 3 lớp (gốc / nền sạch / chữ)
     font_path: str = ""
     uppercase: bool = False
     font_scale: int = 70          # cỡ chữ tối đa, % so với chữ gốc
@@ -96,16 +109,6 @@ def load_project(path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def write_text_export(project: dict, path) -> None:
-    out = []
-    for p in project["pages"]:
-        out.append(f"===== Trang {p['index'] + 1} =====")
-        for k, b in enumerate(p["blocks"], 1):
-            out.append(f"[{k}] {b['text']}\n    → {b['translation']}")
-        out.append("")
-    Path(path).write_text("\n".join(out), encoding="utf-8")
-
-
 def rerender_page(page: dict, font_path: str, uppercase: bool, font_scale: int = 70) -> None:
     """Vẽ lại 1 trang từ ảnh đã xoá chữ + bản dịch (sau khi sửa / đổi font)."""
     clean = imread(page["clean"])
@@ -114,6 +117,7 @@ def rerender_page(page: dict, font_path: str, uppercase: bool, font_scale: int =
     src = imread(page["src"]) if page.get("src") else None
     blocks = [TextBlock.from_dict(d) for d in page["blocks"]]
     imwrite(page["out"], render_page(clean, blocks, font_path, uppercase, src, font_scale / 100))
+    page["blocks"] = [b.to_dict() for b in blocks]  # cập nhật loại bóng / cờ tràn chữ
 
 
 # Giữ model OCR trong bộ nhớ giữa các lần bấm "Bắt đầu" (khỏi tải lại lên GPU)
@@ -157,6 +161,18 @@ def get_local_translator(model_id: str, device: str, src_lang: str, log):
     return _TR_CACHE[key]
 
 
+_LAMA_CACHE = {}
+
+
+def get_lama(device: str, log, stop_event=None):
+    from .inpaint import LamaInpainter
+
+    if device not in _LAMA_CACHE:
+        _LAMA_CACHE.clear()
+        _LAMA_CACHE[device] = LamaInpainter(device, log, stop_event)
+    return _LAMA_CACHE[device]
+
+
 def default_engine(src_lang: str) -> str:
     if src_lang == "en":
         return "gtx"
@@ -164,16 +180,21 @@ def default_engine(src_lang: str) -> str:
 
 
 class Pipeline:
-    def __init__(self, cfg: Config, log=print, stop_event=None):
+    def __init__(self, cfg: Config, log=print, stop_event=None, api_key: str = ""):
         self.cfg = cfg
         self.log = log
         self.stop = stop_event or threading.Event()
+        self.api_key = api_key  # chỉ giữ trong bộ nhớ, không ghi vào project.json
         self.out = Path(cfg.out_dir)
         self.work = self.out / "_work"
         self.project_path = str(self.work / "project.json")
         self.source_name = "truyen"
         self.ocr = None
         self.gtx = None
+        self.local = None
+        self.llm = None
+        self.lama = None
+        self.glossary = None
 
     def prepare_pages(self, source_type: str, source_path: str) -> list:
         self.source_name = Path(source_path).stem or "truyen"
@@ -188,7 +209,7 @@ class Pipeline:
         self.log(f"Tổng cộng {len(pages)} trang.")
         return pages
 
-    def load_models(self) -> None:
+    def load_models(self, need_ocr: bool = True, need_clean: bool = True) -> None:
         from .translators import GTXTranslator
 
         dev = resolve_device(self.cfg.device)
@@ -196,10 +217,33 @@ class Pipeline:
         self.log(f"Thiết bị xử lý: {'GPU ' + info if dev == 'cuda' else 'CPU'}")
         if dev == "cpu" and self.cfg.device == "auto":
             self.log(f"  ({info})")
-        self.ocr = get_ocr(self.cfg.src_lang, dev == "cuda", self.log)
+        if need_ocr:
+            self.ocr = get_ocr(self.cfg.src_lang, dev == "cuda", self.log)
+        if need_clean and self.cfg.use_lama:
+            try:
+                self.lama = get_lama(dev, self.log, self.stop)
+                self.log(f"Xoá chữ trên hình: AI LaMa ({dev.upper()})")
+            except Exception as e:  # noqa: BLE001
+                self.lama = None
+                self.log(f"! Không dùng được LaMa ({e}) – xoá chữ bằng OpenCV")
+        if self.cfg.use_glossary:
+            try:
+                from .store import Glossary
+
+                self.glossary = Glossary()
+            except Exception as e:  # noqa: BLE001
+                self.log(f"! Không mở được bảng thuật ngữ: {e}")
         self.gtx = GTXTranslator(self.log)
         self.local = None
+        self.llm = None
         engine = self.cfg.engine or default_engine(self.cfg.src_lang)
+        if engine == MODES_LLM:
+            from .llm import PROVIDERS, LLMClient
+
+            self.llm = LLMClient(self.cfg.llm_provider, self.cfg.llm_url, self.cfg.llm_model, self.api_key)
+            self.log(f"Bộ dịch: AI {PROVIDERS[self.cfg.llm_provider][0]} – model {self.llm.model or '?'} "
+                     "(dịch cả chương theo ngữ cảnh)")
+            return
         if self.cfg.src_lang == "en":
             engine = "gtx"  # tiếng Anh dịch bằng GTX
         if engine.startswith("local:"):
@@ -215,11 +259,19 @@ class Pipeline:
         if self.local is None:
             self.log("Bộ dịch: GTX Google Translate (miễn phí, cần Internet)")
 
+    # ---------------- dịch ----------------
+    def _post(self, res):
+        if self.glossary is not None:
+            res = self.glossary.apply_post(res, self.cfg.src_lang)
+        return res
+
     def translate(self, texts):
+        """Dịch 1 trang (bộ dịch máy). Câu rỗng giữ rỗng."""
         if not texts:
             return []
         if self.local is None:
-            return self.gtx.translate(texts, self.cfg.src_lang)
+            src = self.glossary.apply_pre(texts, self.cfg.src_lang) if self.glossary is not None else texts
+            return self._post(self.gtx.translate(src, self.cfg.src_lang))
         res = self.local.translate(texts, self.cfg.src_lang)
         miss = [i for i, t in enumerate(res) if not t.strip()]
         if miss and self.cfg.gtx_fallback:
@@ -228,12 +280,79 @@ class Pipeline:
                     res[i] = t
             except Exception:  # noqa: BLE001
                 pass
-        return res
+        return self._post(res)
+
+    def translate_chapter(self, pages_blocks, progress=None):
+        """Dịch cả chương bằng AI: pages_blocks = [(index trang, [TextBlock])]. Ghi .translation tại chỗ."""
+        from .llm import translate_chapter
+
+        items, refs = [], []
+        for idx, blocks in pages_blocks:
+            for b in blocks:
+                if b.keep or not b.text.strip():
+                    continue
+                items.append({"id": len(items) + 1, "page": idx + 1, "text": b.text, "kind": b.kind})
+                refs.append(b)
+        if not items:
+            return
+        terms = self.glossary.terms_for(self.cfg.src_lang, [it["text"] for it in items]) \
+            if self.glossary is not None else []
+        if terms:
+            self.log(f"  Dùng {len(terms)} thuật ngữ từ bảng thuật ngữ")
+        got = translate_chapter(self.llm, self.cfg.src_lang, items, terms, self.cfg.llm_style,
+                                self.cfg.llm_notes, self.log, progress, self.stop)
+        miss = [k for k, it in enumerate(items) if not got.get(it["id"])]
+        if miss and self.cfg.gtx_fallback and not self.stop.is_set():
+            self.log(f"  {len(miss)} câu AI chưa dịch được → GTX dịch bù")
+            try:
+                fb = self.gtx.translate([items[k]["text"] for k in miss], self.cfg.src_lang)
+                for k, t in zip(miss, fb):
+                    if t:
+                        got[items[k]["id"]] = t
+            except Exception as e:  # noqa: BLE001
+                self.log(f"  ! GTX lỗi: {e}")
+        vals = self._post([got.get(it["id"], "") for it in items])
+        for b, v in zip(refs, vals):
+            b.translation = v
+
+    # ---------------- vẽ 1 trang ----------------
+    def _render(self, i, src, img, blocks, ext):
+        clean = clean_page(img, blocks, self.lama)
+        clean_path = self.work / "clean" / f"{i + 1:04d}.png"
+        imwrite(clean_path, clean)
+        out_path = self.out / f"{i + 1:04d}.{ext}"
+        imwrite(out_path, render_page(clean, blocks, self.cfg.font_path, self.cfg.uppercase, img,
+                                      self.cfg.font_scale / 100))
+        return {"index": i, "src": str(src), "clean": str(clean_path), "out": str(out_path),
+                "blocks": [b.to_dict() for b in blocks]}
+
+    def _new_project(self):
+        cfg = asdict(self.cfg)
+        return {"version": 4, "source": self.source_name, "config": cfg, "pages": []}
 
     def run(self, pages, progress=None, page_done=None) -> bool:
-        """progress(số trang xong, tổng số trang)."""
+        """progress(xong, tổng, mô tả). Chế độ AI: đọc chữ cả chương -> dịch 1 lượt -> vẽ."""
+        if self.llm is not None:
+            return self._run_chapter(pages, progress, page_done)
+        return self._run_stream(pages, progress, page_done)
+
+    def _finish(self, project, n, t_all, failed):
+        if self.stop.is_set():
+            self.log("Đã dừng theo yêu cầu.")
+        if project["pages"]:
+            self.export_all(project)
+        if failed:
+            self.log(f"Lưu ý: {failed} khung chưa dịch được – giữ chữ gốc, "
+                     "có thể gõ bản dịch trong bảng rồi bấm Lưu (xem tab Tình trạng).")
+        dt = time.time() - t_all
+        k = len(project["pages"])
+        speed = f" (~{dt / k:.1f}s/trang)" if k else ""
+        self.log(f"Xong {k}/{n} trang trong {dt:.0f}s{speed}.")
+        return not self.stop.is_set()
+
+    def _run_stream(self, pages, progress, page_done) -> bool:
         ext = "png" if self.cfg.img_format == "png" else "jpg"
-        project = {"version": 3, "source": self.source_name, "config": asdict(self.cfg), "pages": []}
+        project = self._new_project()
         n = len(pages)
         t_all = time.time()
         lock = threading.Lock()
@@ -265,15 +384,8 @@ class Pipeline:
         # ----- công đoạn 3: xoá chữ + vẽ chữ + ghi file (CPU, nhiều luồng) -----
         def render_stage(i, src, img, blocks, t_ocr, t_tr):
             t0 = time.time()
-            clean = clean_page(img, blocks)
-            clean_path = self.work / "clean" / f"{i + 1:04d}.png"
-            imwrite(clean_path, clean)
-            out_path = self.out / f"{i + 1:04d}.{ext}"
-            imwrite(out_path, render_page(clean, blocks, self.cfg.font_path, self.cfg.uppercase, img,
-                                            self.cfg.font_scale / 100))
-            page = {"index": i, "src": str(src), "clean": str(clean_path), "out": str(out_path),
-                    "blocks": [b.to_dict() for b in blocks]}
-            miss = sum(1 for b in blocks if not b.translation)
+            page = self._render(i, src, img, blocks, ext)
+            miss = sum(1 for b in blocks if not b.translation and not b.keep)
             with lock:
                 project["pages"].append(page)
                 project["pages"].sort(key=lambda p: p["index"])
@@ -287,7 +399,7 @@ class Pipeline:
             if page_done:
                 page_done(i, page)
             if progress:
-                progress(done, n)
+                progress(done, n, f"Trang {done}/{n}")
 
         th = threading.Thread(target=ocr_stage, daemon=True)
         th.start()
@@ -303,19 +415,18 @@ class Pipeline:
                     with lock:
                         state["done"] += 1
                     if progress:
-                        progress(state["done"], n)
+                        progress(state["done"], n, f"Trang {state['done']}/{n}")
                     continue
                 if self.stop.is_set():  # đã bấm Dừng -> bỏ các trang còn trong hàng đợi
                     continue
                 t0 = time.time()
-                if True:
-                    try:
-                        trans = self.translate([b.text for b in blocks])
-                    except Exception as e:  # noqa: BLE001
-                        self.log(f"! Trang {i + 1}: lỗi dịch ({e})")
-                        trans = [""] * len(blocks)
-                    for b, t in zip(blocks, trans):
-                        b.translation = t
+                try:
+                    trans = self.translate([b.text for b in blocks])
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"! Trang {i + 1}: lỗi dịch ({e})")
+                    trans = [""] * len(blocks)
+                for b, t in zip(blocks, trans):
+                    b.translation = t
                 futures.append(pool.submit(render_stage, i, src, img, blocks, t_ocr, time.time() - t0))
             for f in futures:
                 try:
@@ -323,21 +434,121 @@ class Pipeline:
                 except Exception as e:  # noqa: BLE001
                     self.log(f"! Lỗi khi vẽ/ghi trang: {e}")
         th.join(timeout=5)
-        if self.stop.is_set():
-            self.log("Đã dừng theo yêu cầu.")
+        return self._finish(project, n, t_all, state["failed"])
 
-        if project["pages"]:
-            write_text_export(project, self.out / "ban_dich.txt")
-            if self.cfg.export_pdf:
-                pdf = self.out / f"{self.source_name}_vi.pdf"
-                self.log("Đang xuất PDF...")
-                export_pdf([p["out"] for p in project["pages"]], pdf)
-                self.log(f"Đã xuất PDF: {pdf.name}")
-        if state["failed"]:
-            self.log(f"Lưu ý: {state['failed']} khung chưa dịch được – giữ chữ gốc, "
-                     "có thể gõ bản dịch trong bảng rồi bấm Lưu.")
-        dt = time.time() - t_all
-        k = len(project["pages"])
-        speed = f" (~{dt / k:.1f}s/trang)" if k else ""
-        self.log(f"Xong {k}/{n} trang trong {dt:.0f}s{speed}.")
+    def _run_chapter(self, pages, progress, page_done) -> bool:
+        """AI dịch theo ngữ cảnh: tiến độ chia 3 chặng – đọc chữ 45%, AI dịch 25%, vẽ chữ 30%."""
+        ext = "png" if self.cfg.img_format == "png" else "jpg"
+        project = self._new_project()
+        n = len(pages)
+        t_all = time.time()
+        U = 1000  # thang tiến độ
+
+        def prog(frac, text):
+            if progress:
+                progress(int(U * min(1.0, frac)), U, text)
+
+        # 1. đọc chữ cả chương (ảnh đọc sẵn ở luồng phụ)
+        read = []
+        for i, src in enumerate(pages):
+            if self.stop.is_set():
+                break
+            img = imread(src)
+            if img is None:
+                self.log(f"! Bỏ qua trang {i + 1}: không đọc được {Path(src).name}")
+                continue
+            t0 = time.time()
+            try:
+                blocks = self.ocr.process(img)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"! Trang {i + 1}: lỗi OCR ({e})")
+                blocks = []
+            self.log(f"Đọc chữ trang {i + 1}/{n}: {len(blocks)} khung – {time.time() - t0:.1f}s")
+            read.append((i, src, img, blocks))
+            prog(0.45 * (i + 1) / n, f"Đọc chữ trang {i + 1}/{n}")
+        if self.stop.is_set():
+            return self._finish(project, n, t_all, 0)
+
+        # 2. AI dịch cả chương một lượt
+        self.log(f"AI đang dịch cả chương ({sum(len(r[3]) for r in read)} khung chữ)...")
+        prog(0.45, "AI đang dịch cả chương...")
+        self.translate_chapter([(i, blocks) for i, _s, _im, blocks in read],
+                               progress=lambda k, m: prog(0.45 + 0.25 * k / max(1, m),
+                                                          f"AI đang dịch phần {min(k + 1, m)}/{m}"))
+        # 3. xoá chữ + vẽ chữ song song
+        lock = threading.Lock()
+        state = {"done": 0, "failed": 0}
+
+        def render_one(i, src, img, blocks):
+            page = self._render(i, src, img, blocks, ext)
+            miss = sum(1 for b in blocks if not b.translation and not b.keep)
+            with lock:
+                project["pages"].append(page)
+                project["pages"].sort(key=lambda p: p["index"])
+                save_project(project, self.project_path)
+                state["done"] += 1
+                state["failed"] += miss
+                d = state["done"]
+            if page_done:
+                page_done(i, page)
+            prog(0.70 + 0.30 * d / max(1, len(read)), f"Vẽ chữ trang {d}/{len(read)}")
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = [pool.submit(render_one, *r) for r in read if not self.stop.is_set()]
+            for f in futs:
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"! Lỗi khi vẽ/ghi trang: {e}")
+        return self._finish(project, n, t_all, state["failed"])
+
+    # ---------------- dịch lại dự án đã có (không đọc lại chữ) ----------------
+    def retranslate(self, project, progress=None, page_done=None, only_empty=False) -> bool:
+        """Dịch lại mọi khung của dự án bằng bộ dịch đang chọn (vd. sau khi sửa bảng thuật ngữ),
+        rồi vẽ lại. only_empty=True: chỉ dịch các khung đang trống."""
+        t_all = time.time()
+        pages = project["pages"]
+        cfg = project.setdefault("config", {})
+        U = 1000
+
+        def prog(frac, text):
+            if progress:
+                progress(int(U * min(1.0, frac)), U, text)
+
+        blocks_by_page = [(p["index"], [TextBlock.from_dict(d) for d in p["blocks"]]) for p in pages]
+        if only_empty:
+            todo = [(i, [b for b in bl if not b.translation]) for i, bl in blocks_by_page]
+        else:
+            todo = blocks_by_page
+        prog(0.02, "Đang dịch lại...")
+        if self.llm is not None:
+            self.translate_chapter(todo, progress=lambda k, m: prog(0.6 * k / max(1, m),
+                                                                    f"AI đang dịch phần {min(k + 1, m)}/{m}"))
+        else:
+            for k, (i, bl) in enumerate(todo):
+                if self.stop.is_set():
+                    break
+                sel = [b for b in bl if not b.keep]
+                for b, t in zip(sel, self.translate([b.text for b in sel])):
+                    b.translation = t
+                prog(0.6 * (k + 1) / max(1, len(todo)), f"Dịch lại trang {k + 1}/{len(todo)}")
+        for k, (p, (_i, bl)) in enumerate(zip(pages, blocks_by_page)):
+            if self.stop.is_set():
+                break
+            p["blocks"] = [b.to_dict() for b in bl]
+            rerender_page(p, self.cfg.font_path or cfg.get("font_path", ""), self.cfg.uppercase,
+                          self.cfg.font_scale)
+            if page_done:
+                page_done(p["index"], p)
+            prog(0.6 + 0.4 * (k + 1) / len(pages), f"Vẽ lại trang {k + 1}/{len(pages)}")
+        cfg.update({k: v for k, v in asdict(self.cfg).items() if k != "out_dir"})
+        save_project(project, self.project_path)
+        self.export_all(project)
+        self.log(f"Đã dịch lại {len(pages)} trang trong {time.time() - t_all:.0f}s.")
         return not self.stop.is_set()
+
+    # ---------------- xuất file ----------------
+    def export_all(self, project):
+        from .exporter import export_extras
+
+        export_extras(project, self.out, self.cfg, self.log)

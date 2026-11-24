@@ -213,7 +213,11 @@ class AboutDialog(QDialog):
             "Dịch truyện tranh <b>Trung / Nhật / Anh → Việt</b>: nhận dạng chữ, dịch, xoá chữ gốc "
             "và vẽ chữ Việt vừa khít bóng thoại.<br><br>"
             "• OCR: EasyOCR, manga-ocr (GPU)<br>"
-            "• Dịch: HachimiMT, NLLB-200, Opus-MT (chạy trên máy) hoặc Google GTX<br>"
+            "• Xoá chữ: AI LaMa cho manga (AnimeMangaInpainting, MIT)<br>"
+            "• Dịch: HachimiMT, NLLB-200, Opus-MT (chạy trên máy), Google GTX, "
+            "hoặc AI (Ollama, LM Studio, DeepSeek, Gemini, OpenAI, Claude) dịch cả chương<br>"
+            "• Font: Google Fonts (SIL OFL 1.1)<br>"
+            "• Một số ý tưởng tham khảo từ MangaForge (không dùng mã nguồn)<br>"
             f"• Bản: {'Portable' if IS_PORTABLE else 'Cài đặt'}{('  •  ' + gpu_text) if gpu_text else ''}<br><br>"
             f"<a style='color:#a78bfa' href='{GITHUB_URL}'>{GITHUB_URL}</a>")
         txt.setWordWrap(True)

@@ -15,6 +15,8 @@ APP_DIR = Path(__file__).resolve().parent.parent
 ROOT_DIR = APP_DIR.parent
 IS_PORTABLE = (ROOT_DIR / "python" / "python.exe").exists() and APP_DIR.name.lower() == "app"
 MODELS_DIR = (ROOT_DIR if IS_PORTABLE else APP_DIR) / "models"
+# config.json (cài đặt) + data.db (bảng thuật ngữ): bản portable để cạnh DichTruyenTranh.exe
+DATA_DIR = ROOT_DIR if IS_PORTABLE else APP_DIR
 ICON_PATH = APP_DIR / "icon.ico"
 
 

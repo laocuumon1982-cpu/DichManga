@@ -3,58 +3,87 @@
 - LocalTranslator: model chạy trên máy (HachimiMT cho tiếng Trung, NLLB-200 / Opus-MT
   cho tiếng Nhật). GPU: PyTorch fp16 dịch theo lô. CPU: CTranslate2 INT8 nếu có.
 """
+import json
 import time
 from pathlib import Path
 from urllib.parse import quote
 
-import requests
-
 
 class GTXTranslator:
+    """Google Translate miễn phí. Gọi bằng urllib (Google hay chặn 'dấu vân tay' của thư viện
+    requests bằng lỗi 429). Đường chính: translate_a/single (client=gtx). Bị chặn thì chuyển
+    sang đường dự phòng translate_a/t (client=dict-chrome-ex) dịch nhiều câu một lần."""
     URL = "https://translate.googleapis.com/translate_a/single"
+    URL_DICT = "https://clients5.google.com/translate_a/t"
     CODES = {"zh": "zh-CN", "zh_tw": "zh-TW", "ja": "ja", "en": "en"}
     CHUNK = 1000        # số ký tự tối đa gộp trong 1 lần gọi
     GET_LIMIT = 6000    # URL dài hơn mức này thì dùng POST
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
 
     def __init__(self, log=print, delay: float = 0.1):
         self.log = log
         self.delay = delay
         self.cache = {}
-        self.s = requests.Session()
-        self.s.headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-        )
+
+    def _open(self, url, params, post_q=None, timeout=20):
+        import urllib.parse
+        import urllib.request
+
+        q = urllib.parse.urlencode(params, doseq=True)
+        if post_q is None:
+            req = urllib.request.Request(f"{url}?{q}", headers={"User-Agent": self.UA})
+        else:
+            req = urllib.request.Request(
+                f"{url}?{q}", data=urllib.parse.urlencode({"q": post_q}).encode("utf-8"),
+                headers={"User-Agent": self.UA, "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
 
     def _call(self, text: str, sl: str, tl: str = "vi") -> str:
+        import urllib.error
+
         params = {"client": "gtx", "sl": sl, "tl": tl, "dt": "t", "ie": "UTF-8", "oe": "UTF-8"}
         use_post = len(quote(text)) > self.GET_LIMIT
         last = None
-        for attempt in range(5):
+        for attempt in range(4):
             try:
                 if use_post:
-                    r = self.s.post(self.URL, params=params, data={"q": text}, timeout=20)
+                    data = self._open(self.URL, params, post_q=text)
                 else:
-                    r = self.s.get(self.URL, params={**params, "q": text}, timeout=20)
-                if r.status_code == 429:  # gọi quá nhanh -> chờ lâu dần rồi thử lại
-                    last = "HTTP 429 – Google tạm chặn vì gọi quá nhanh"
-                    time.sleep(5 * (attempt + 1))
-                    continue
-                if r.status_code in (405, 411, 413) and use_post:
-                    use_post = False
-                    continue
-                r.raise_for_status()
-                data = r.json()
+                    data = self._open(self.URL, {**params, "q": text})
                 if not data or not data[0]:
                     return ""
                 return "".join(seg[0] for seg in data[0] if seg and seg[0])
-            except requests.RequestException as e:
+            except urllib.error.HTTPError as e:
+                last = f"HTTP {e.code}"
+                if e.code == 429:  # gọi quá nhanh -> chờ lâu dần rồi thử lại
+                    last = "HTTP 429 – Google tạm chặn vì gọi quá nhanh"
+                    time.sleep(4 * (attempt + 1))
+                elif e.code in (405, 411, 413) and use_post:
+                    use_post = False
+                else:
+                    time.sleep(1.5 * (attempt + 1))
+            except (OSError, ValueError) as e:  # mạng / JSON hỏng
                 last = e
                 time.sleep(1.5 * (attempt + 1))
-            except ValueError as e:  # JSON hỏng
-                last = e
-                time.sleep(1)
         raise RuntimeError(f"GTX lỗi: {last}")
+
+    def _call_dict(self, texts, sl: str, tl: str = "vi"):
+        """Đường dự phòng: dịch nhiều câu 1 lần, trả về đúng số câu."""
+        params = [("client", "dict-chrome-ex"), ("sl", sl), ("tl", tl)] + [("q", t) for t in texts]
+        data = self._open(self.URL_DICT, params)
+        out = []
+        for x in data:
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, list) and x:
+                out.append(x[0] if isinstance(x[0], str) else str(x[0]))
+            else:
+                out.append("")
+        if len(out) != len(texts):
+            raise ValueError("số câu trả về không khớp")
+        return [o.strip() for o in out]
 
     def translate(self, texts, src_lang: str):
         """Dịch danh sách câu. Câu nào lỗi trả về chuỗi rỗng (không làm hỏng cả trang)."""
@@ -80,26 +109,34 @@ class GTXTranslator:
         if cur:
             chunks.append(cur)
 
+        def keep(pairs, outs):
+            for (i, t), o in zip(pairs, outs):
+                results[i] = o
+                if o:
+                    self.cache[(sl, t)] = o
+
         for ch in chunks:
             done = False
             if len(ch) > 1:
                 try:  # gộp nhiều khung thoại vào 1 lần gọi, mỗi khung 1 dòng
-                    out = self._call("\n".join(t for _, t in ch), sl).split("\n")
-                    out = [o.strip() for o in out]
+                    out = [o.strip() for o in self._call("\n".join(t for _, t in ch), sl).split("\n")]
                     if len(out) == len(ch) and all(out):
-                        for (i, t), o in zip(ch, out):
-                            results[i] = o
-                            self.cache[(sl, t)] = o
+                        keep(ch, out)
                         done = True
                 except Exception as e:  # noqa: BLE001
-                    self.log(f"  ! {e}")
-            if not done:  # số dòng không khớp / 1 câu -> dịch từng khung
+                    self.log(f"  ! {e} – thử đường dự phòng")
+            if not done:
+                try:  # đường dự phòng: nhiều câu 1 lần, không lo lệch dòng
+                    keep(ch, self._call_dict([t for _, t in ch], sl))
+                    done = all(results[i] for i, _ in ch)
+                except Exception:  # noqa: BLE001
+                    pass
+            if not done:  # vẫn thiếu -> dịch từng khung
                 for i, t in ch:
+                    if results[i]:
+                        continue
                     try:
-                        o = self._call(t, sl).strip()
-                        results[i] = o
-                        if o:
-                            self.cache[(sl, t)] = o
+                        keep([(i, t)], [self._call(t, sl).strip()])
                     except Exception as e:  # noqa: BLE001
                         self.log(f"  ! Không dịch được '{t[:20]}': {e}")
                     time.sleep(self.delay)

@@ -19,8 +19,10 @@ _font_cache = {}
 
 
 def find_default_font() -> str:
-    """Ưu tiên font đặt trong thư mục fonts/ của app, sau đó font có sẵn của Windows."""
+    """Ưu tiên font mặc định kèm app (Be Vietnam Pro đậm), rồi font khác trong fonts/, rồi font Windows."""
     fonts_dir = APP_DIR / "fonts"
+    if (fonts_dir / "BeVietnamPro-Bold.ttf").exists():
+        return str(fonts_dir / "BeVietnamPro-Bold.ttf")
     if fonts_dir.is_dir():
         found = sorted(list(fonts_dir.glob("*.ttf")) + list(fonts_dir.glob("*.otf")))
         if found:
@@ -51,12 +53,17 @@ def get_font(path: str, size: int):
 
 
 # ---------------- xoá chữ gốc ----------------
-def clean_page(img, blocks):
-    """Nền đồng màu (bóng thoại) -> tô màu nền; nền phức tạp -> inpaint."""
+def clean_page(img, blocks, inpainter=None):
+    """Xoá chữ gốc. Bóng thoại nền phẳng -> tô thẳng màu nền (giữ nguyên viền bóng, sạch tuyệt đối).
+    Chữ nằm trên hình / nền lưới chấm -> AI LaMa (inpainter) nếu có, không thì OpenCV inpaint.
+    Ô 'giữ nguyên' không bị xoá."""
     out = img.copy()
     H, W = img.shape[:2]
     kernel = np.ones((5, 5), np.uint8)
+    ai_mask = np.zeros((H, W), np.uint8) if inpainter is not None else None
     for b in blocks:
+        if getattr(b, "keep", False):
+            continue
         cs = b.char_size()
         pad = max(2, int(cs * 0.15))
         m = max(10, int(cs * 0.6))
@@ -73,38 +80,104 @@ def clean_page(img, blocks):
         vals = roi[ring > 0]
         if len(vals) > 10 and vals.std(axis=0).max() < 22:
             roi[mask > 0] = np.median(vals, axis=0).astype(np.uint8)
+        elif ai_mask is not None:
+            ai_mask[ry0:ry1, rx0:rx1] |= mask
         else:
             roi[:] = cv2.inpaint(roi, mask, max(3, int(cs * 0.3)), cv2.INPAINT_TELEA)
+    if ai_mask is not None and ai_mask.any():
+        try:
+            out = inpainter.inpaint(out, ai_mask)
+        except Exception:  # noqa: BLE001  (hết VRAM...) -> quay về OpenCV
+            out = cv2.inpaint(out, ai_mask, 5, cv2.INPAINT_TELEA)
     return out
 
 
 # ---------------- tìm bóng thoại ----------------
+KIND_VI = {"speech": "Thoại", "thought": "Suy nghĩ", "shout": "Hét", "narration": "Dẫn truyện",
+           "free": "Chữ trên hình", "sfx": "SFX"}
+
+
+def classify_shape(comp) -> str:
+    """Đoán loại bóng từ hình dạng vùng lòng bóng (uint8 0/1):
+    narration = hộp chữ nhật; shout = viền nhiều gai nhọn; thought = viền gợn tròn kiểu đám mây;
+    còn lại là bóng thoại thường."""
+    cnts, _ = cv2.findContours((comp > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return "speech"
+    cnt = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    if area < 50:
+        return "speech"
+    hull_area = max(cv2.contourArea(cv2.convexHull(cnt)), 1.0)
+    solidity = area / hull_area
+    _, _, bw, bh = cv2.boundingRect(cnt)
+    rect_fill = area / max(1.0, bw * bh)
+    # viền lồi lõm: đếm chỗ lõm đáng kể (đuôi bóng thoại chỉ tạo 1–2 chỗ lõm)
+    try:
+        defects = cv2.convexityDefects(cnt, cv2.convexHull(cnt, returnPoints=False))
+    except cv2.error:
+        defects = None
+    root = np.sqrt(area)
+    depths = np.array([]) if defects is None else defects.reshape(-1, 4)[:, 3] / 256.0
+    deep = depths[depths > 0.03 * root]
+    if len(deep) >= 6:
+        # gai hét lõm sâu (viền răng cưa); mây suy nghĩ chỉ gợn nông giữa các cung tròn
+        return "shout" if np.median(deep) > 0.09 * root else "thought"
+    if rect_fill > 0.9 and solidity > 0.95:
+        return "narration"
+    return "speech"
+
+
 def _bg_gray(gray_roi, b, ox, oy):
     """Màu nền (xám) tại chỗ chữ gốc sau khi đã xoá chữ."""
     reg = gray_roi[b.y0 - oy:b.y1 - oy, b.x0 - ox:b.x1 - ox]
     return int(np.median(reg)) if reg.size else 255
 
 
+def _on_art(gray_raw, b) -> bool:
+    """Chữ nằm trên hình / nền lưới chấm? (nền chỗ chữ – đã xoá chữ – không đồng màu)."""
+    reg = gray_raw[b.y0:b.y1, b.x0:b.x1]
+    if reg.size == 0:
+        return True
+    return reg.std() > 30 or cv2.medianBlur(reg, 5).std() > 20
+
+
 def find_bubble(clean, b):
     """Lấy đúng HÌNH lòng bóng thoại quanh khung chữ.
     Chịu được nhiễu JPEG, lưới chấm và viền bóng bị hở (chặn bằng viền được làm dày dần).
-    Trả về (mask bool, ox, oy) hoặc None nếu chữ không nằm trong bóng kín."""
+    Vùng tìm tự nới dần (chữ nhỏ trong bóng to). Trả về (mask bool, ox, oy, loại bóng)
+    hoặc None nếu chữ không nằm trong bóng kín."""
     H, W = clean.shape[:2]
     cs = b.char_size()
-    ext = int(max(b.w, b.h) * 1.2 + 3 * cs)
-    rx0, ry0 = max(0, b.x0 - ext), max(0, b.y0 - ext)
-    rx1, ry1 = min(W, b.x1 + ext), min(H, b.y1 + ext)
-    roi = clean[ry0:ry1, rx0:rx1]
-    h, w = roi.shape[:2]
-    gray = cv2.medianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), 5)
+    gray_all = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+    if _on_art(gray_all, b):
+        return None
+    for factor in (1.2, 2.5, 4.5):
+        ext = int(max(b.w, b.h) * factor + 3 * cs)
+        rx0, ry0 = max(0, b.x0 - ext), max(0, b.y0 - ext)
+        rx1, ry1 = min(W, b.x1 + ext), min(H, b.y1 + ext)
+        found = _flood_bubble(gray_all[ry0:ry1, rx0:rx1], b, rx0, ry0, cs)
+        if found is not None:
+            m, kind = found
+            if m.sum() > 0.45 * W * H:  # rộng gần nửa trang -> là lề trang, không phải bóng
+                return None
+            return m, rx0, ry0, kind
+        if rx0 == 0 and ry0 == 0 and rx1 == W and ry1 == H:
+            break
+    return None
+
+
+def _flood_bubble(gray_roi, b, rx0, ry0, cs):
+    h, w = gray_roi.shape[:2]
+    gray = cv2.medianBlur(gray_roi, 3)  # nhẹ: lọc nhiễu JPEG nhưng giữ chấm lưới (làm hàng rào)
     reg = gray[b.y0 - ry0:b.y1 - ry0, b.x0 - rx0:b.x1 - rx0]
-    if reg.size == 0 or reg.std() > 20:
-        return None  # nền chỗ chữ không đồng màu -> chữ nằm trên hình
+    if reg.size == 0:
+        return None
     bg = int(np.median(reg))
     near = (np.abs(gray.astype(np.int16) - bg) <= 30).astype(np.uint8)
     barrier = (1 - near).astype(np.uint8)
     sy, sx = (b.y0 + b.y1) // 2 - ry0, (b.x0 + b.x1) // 2 - rx0
-    for gap in (0, 2, 4, 7):  # viền bóng hở <= 2*gap px vẫn chặn được
+    for gap in (0, 2, 4, 7, 11):  # viền bóng hở <= 2*gap px vẫn chặn được
         area = near.copy()
         if gap:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gap + 1, 2 * gap + 1))
@@ -121,12 +194,13 @@ def find_bubble(clean, b):
         if gap:
             comp = cv2.dilate(comp, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gap + 1, 2 * gap + 1)))
             comp &= near | comp  # không lấn ra ngoài vùng sáng
+        kind = classify_shape(comp)
         m = cv2.morphologyEx(comp, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
         bh_, bw_ = ys.max() - ys.min(), xs.max() - xs.min()
         margin = int(max(4, cs * 0.35, 0.12 * min(bw_, bh_)))
         m = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1)))
         if m.any():
-            return m > 0, rx0, ry0
+            return m > 0, kind
     return None
 
 
@@ -135,12 +209,17 @@ def safe_rect(clean, b):
     chút MIỄN LÀ vẫn là nền trơn cùng màu – không bao giờ lấn sang hình vẽ."""
     H, W = clean.shape[:2]
     cs = b.char_size()
-    gray = cv2.medianBlur(cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY), 3) if min(H, W) > 5 else \
-        cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+    raw = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(raw, 3) if min(H, W) > 5 else raw
     reg = gray[b.y0:b.y1, b.x0:b.x1]
     x0, y0, x1, y1 = b.x0, b.y0, b.x1, b.y1
-    if reg.size == 0 or reg.std() > 20:
-        return x0, y0, x1, y1  # chữ trên hình: giữ đúng khung chữ gốc
+    if reg.size == 0 or _on_art(raw, b):
+        # chữ nằm trên hình (không có viền bóng để tràn ra): chữ Việt dài hơn chữ Hán/Nhật
+        # nên cho rộng hơn khung chữ gốc một chút, chữ có viền tương phản nên vẫn dễ đọc
+        cx_, cy_ = (x0 + x1) / 2, (y0 + y1) / 2
+        hw = max(b.w * 0.75, b.h * 0.6 if b.vertical else 0, cs * 2.5)
+        hh = max(b.h * 0.65, cs)
+        return (int(max(0, cx_ - hw)), int(max(0, cy_ - hh)), int(min(W, cx_ + hw)), int(min(H, cy_ + hh)))
     bg = int(np.median(reg))
     step = max(2, cs // 4)
     lim = int(max(b.w, b.h) * 0.8 + cs)
@@ -195,11 +274,11 @@ def _row_spans(mask, cx):
 
 
 def layout_region(clean, b):
-    """Vùng đặt chữ: (L, R, ox, oy, cx, cy) – độ rộng từng hàng theo đúng hình bóng thoại;
+    """Vùng đặt chữ: (L, R, ox, oy, cx, cy, loại) – độ rộng từng hàng theo đúng hình bóng thoại;
     không có bóng kín thì dùng vùng nền trơn quanh chữ gốc (safe_rect)."""
     found = find_bubble(clean, b)
     if found is not None:
-        m, ox, oy = found
+        m, ox, oy, kind = found
         ys, xs = np.nonzero(m)
         # tâm: lấy tâm khung chữ gốc kéo về tâm bóng (bóng có đuôi thì tâm hình bị lệch)
         cx = int(round(0.5 * xs.mean() + 0.5 * ((b.x0 + b.x1) / 2 - ox)))
@@ -207,12 +286,15 @@ def layout_region(clean, b):
         if not (0 <= cy < m.shape[0] and 0 <= cx < m.shape[1]) or not m[cy, cx]:
             cx, cy = int(xs.mean()), int(ys.mean())
         L, R = _row_spans(m, cx)
-        return L, R, ox, oy, cx, cy
+        return L, R, ox, oy, cx, cy, kind
     x0, y0, x1, y1 = safe_rect(clean, b)
     h = max(1, y1 - y0)
     L = np.zeros(h, np.int32)
     R = np.full(h, max(1, x1 - x0 - 1), np.int32)
-    return L, R, x0, y0, (x1 - x0) // 2, h // 2
+    H, W = clean.shape[:2]
+    big = b.w * b.h > 0.02 * W * H
+    kind = "sfx" if big and len((b.text or "").replace(" ", "")) <= 8 else "free"
+    return L, R, x0, y0, (x1 - x0) // 2, h // 2, kind
 
 
 # ---------------- dàn chữ ----------------
@@ -334,35 +416,43 @@ def _fallback_layout(text, font_path, L, R, cx, cy, size):
     return font, size, sw, [(ln, cx, top + i * lh) for i, ln in enumerate(lines)], yoff
 
 
-def render_page(cleaned_bgr, blocks, font_path, uppercase=False, src_bgr=None, font_scale=0.7):
+def render_page(cleaned_bgr, blocks, font_path, uppercase=False, src_bgr=None, font_scale=0.7,
+                text_only=False):
     """Vẽ bản dịch lên ảnh đã xoá chữ. Cỡ chữ gần bằng chữ gốc và tự thu nhỏ cho vừa
-    đúng hình bóng thoại. Khung nào chưa có bản dịch thì dán lại chữ gốc."""
+    đúng hình bóng thoại. Khung nào chưa có bản dịch / giữ nguyên thì dán lại chữ gốc.
+    text_only=True: trả về lớp chữ RGBA nền trong suốt (cho file PSD nhiều lớp)."""
     if not font_path or not Path(font_path).exists():
         font_path = find_default_font()
     base = cleaned_bgr.copy()
     H, W = base.shape[:2]
-    if src_bgr is not None and src_bgr.shape[:2] == (H, W):
+    if src_bgr is not None and src_bgr.shape[:2] == (H, W) and not text_only:
         for b in blocks:
-            if not (b.translation or "").strip():
+            if b.keep or not (b.translation or "").strip():
                 m = max(4, b.char_size() // 2)
                 x0, y0 = max(0, b.x0 - m), max(0, b.y0 - m)
                 x1, y1 = min(W, b.x1 + m), min(H, b.y1 + m)
                 base[y0:y1, x0:x1] = src_bgr[y0:y1, x0:x1]
-    pil = Image.fromarray(cv2.cvtColor(base, cv2.COLOR_BGR2RGB))
+    if text_only:
+        pil = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    else:
+        pil = Image.fromarray(cv2.cvtColor(base, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
     for b in blocks:
+        b.overflow = False
         text = " ".join((b.translation or "").split())
-        if not text:
+        L, R, ox, oy, cx, cy, kind = layout_region(cleaned_bgr, b)
+        b.kind = kind
+        if not text or b.keep:
             continue
-        if uppercase:
+        if uppercase or kind in ("shout", "sfx"):
             text = text.upper()
         cs = b.char_size()
         # cỡ tối đa = font_scale × cỡ chữ gốc (mặc định 70%), tự thu nhỏ tới khi nằm gọn
         max_size = int(min(56, max(10, cs * font_scale)))
         min_size = int(max(7, min(max_size, cs * 0.3)))
-        L, R, ox, oy, cx, cy = layout_region(cleaned_bgr, b)
         res = fit_in_shape(text, font_path, L, R, cy, max_size, min_size)
         if res is None:
+            b.overflow = True  # phải thu nhỏ dưới mức cho phép -> báo ở tab Tình trạng
             res = fit_in_shape(text, font_path, L, R, cy, min_size - 1, 6)
         if res is None:
             res = _fallback_layout(text, font_path, L, R, cx, cy, 7 if min_size > 7 else min_size)
@@ -376,4 +466,6 @@ def render_page(cleaned_bgr, blocks, font_path, uppercase=False, src_bgr=None, f
             x = ox + lx - font.getlength(line) / 2
             y = oy + ly - yoff  # đỉnh dấu cao nhất trùng đỉnh dòng đã tính
             draw.text((x, y), line, font=font, fill=fill, stroke_width=sw, stroke_fill=stroke)
+    if text_only:
+        return np.array(pil)  # RGBA
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)

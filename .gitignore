@@ -8,3 +8,6 @@ _backup/
 app_log.txt
 demo_build/
 *.tmp
+config.json
+data.db
+*.part

@@ -93,7 +93,7 @@ if (-not $AppOnly) {
     Step "4/5 Thư viện còn lại"
     Run $Py @("-m", "pip", "install", "--no-warn-script-location", "--no-cache-dir", "--no-build-isolation",
               "-r", "$Src\requirements.txt", "-c", $cons)
-    Run $Py @("-c", "import torch, easyocr, manga_ocr, fitz, PySide6, ctranslate2, transformers; print('OK torch', torch.__version__, 'cuda', torch.version.cuda)")
+    Run $Py @("-c", "import torch, easyocr, manga_ocr, fitz, PySide6, ctranslate2, transformers, openpyxl, psd_tools; print('OK torch', torch.__version__, 'cuda', torch.version.cuda)")
 }
 
 Step "5/5 Chép app + tạo DichTruyenTranh.exe"

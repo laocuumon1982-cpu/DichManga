@@ -1,1 +1,5 @@
-Chep file font .ttf ho tro tieng Viet vao day, app se tu dung font dau tien.
+Font kem app (giay phep SIL Open Font License 1.1 - xem thu muc licenses\), lay tu Google Fonts:
+https://github.com/google/fonts  - tat ca deu du chu co dau tieng Viet.
+
+Muon them font rieng: chep file .ttf / .otf vao thu muc nay, mo lai app la thay trong o "Font chu".
+App tu kiem tra font co du dau tieng Viet khong (thieu dau se bao canh bao).

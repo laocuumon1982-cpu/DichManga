@@ -33,6 +33,10 @@ def main(langs):
     from core.ocr import EASYOCR_LANGS
     from core.translators import CT2_REPOS, CT2_SUBFOLDER
 
+    step("Model xoá chữ LaMa (~200 MB)")
+    from core.inpaint import download_model
+
+    download_model(log=print)
     mdir = easyocr_dir()
     kw = {"model_storage_directory": mdir} if mdir else {}
     for lang in langs:

@@ -2,7 +2,8 @@
 
 Nguồn: thư mục ảnh (đánh số trang) hoặc file PDF (kéo thả vào cửa sổ cũng được).
 Dịch: model chạy trên máy (HachimiMT cho tiếng Trung, NLLB-200 cho tiếng Nhật) trên GPU,
-hoặc GTX Google Translate (miễn phí, online). OCR chạy trên GPU NVIDIA nếu máy có.
+AI (LLM: Ollama / LM Studio / DeepSeek / Gemini / OpenAI / Claude) dịch cả chương theo ngữ cảnh,
+hoặc GTX Google Translate (miễn phí, online). OCR + xoá chữ (LaMa) chạy trên GPU NVIDIA nếu máy có.
 """
 import argparse
 import os
@@ -21,7 +22,7 @@ from core.paths import ICON_PATH, IS_PORTABLE, setup_env  # noqa: E402
 setup_env()  # phải chạy trước khi import PySide6 / torch
 
 from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal  # noqa: E402
-from PySide6.QtGui import QDesktopServices, QIcon, QPixmap  # noqa: E402
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QPixmap  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
@@ -32,8 +33,12 @@ from PySide6.QtWidgets import (  # noqa: E402
 from core.loader import IMG_EXT, export_pdf, list_images, pdf_page_count  # noqa: E402
 from core.pipeline import (Config, Pipeline, default_engine, gpu_info, load_project,  # noqa: E402
                            rerender_page, save_project, write_text_export)
-from core.typeset import find_default_font  # noqa: E402
+from core.fonts import list_fonts, vi_missing  # noqa: E402
+from core.llm import PROVIDERS, LLMClient, friendly_error  # noqa: E402
+from core.store import JsonSettings  # noqa: E402
+from core.typeset import KIND_VI, find_default_font  # noqa: E402
 from ui.dialogs import AboutDialog, UpdateChecker, UpdateDialog  # noqa: E402
+from ui.glossary import GlossaryDialog  # noqa: E402
 from ui.theme import QSS  # noqa: E402
 from ui.widgets import Card, CompareView, field, thumb_size  # noqa: E402
 
@@ -55,6 +60,10 @@ ENGINES = {
 }
 ENGINES["zh_tw"] = ENGINES["zh"]
 ENGINES["en"] = [("GTX Google – online, miễn phí", "gtx")]
+LLM_ITEM = ("🤖 AI (LLM) – dịch cả chương theo ngữ cảnh", "llm")
+for _k in ENGINES:
+    ENGINES[_k] = ENGINES[_k] + [LLM_ITEM]
+TAB_VIEW, TAB_STATUS, TAB_LOG = 0, 1, 2
 DEVICES = [("⚡ Tự động – ưu tiên GPU", "auto"), ("Chỉ GPU (CUDA)", "cuda"), ("Chỉ CPU", "cpu")]
 
 
@@ -63,21 +72,36 @@ DEVICES = [("⚡ Tự động – ưu tiên GPU", "auto"), ("Chỉ GPU (CUDA)", 
 # =====================================================================
 class Worker(QThread):
     log = Signal(str)
-    progress = Signal(int, int)
+    progress = Signal(int, int, str)
     pages_ready = Signal(list)
     page_done = Signal(int, object)
     finished_ok = Signal(bool, str)
     stage = Signal(str)
 
-    def __init__(self, cfg: Config, source_type: str, source_path: str):
+    def __init__(self, cfg: Config, source_type: str = "", source_path: str = "", api_key: str = "",
+                 project=None, project_path: str = ""):
         super().__init__()
         self.cfg, self.source_type, self.source_path = cfg, source_type, source_path
+        self.api_key = api_key
+        self.project, self.project_path = project, project_path  # có project -> chế độ Dịch lại
         self.stop_event = threading.Event()
 
+    def _prog(self, d, n, text=""):
+        self.progress.emit(int(d), int(n), text or "")
+
     def run(self):
-        project_path = ""
+        project_path = self.project_path
         try:
-            pipe = Pipeline(self.cfg, log=self.log.emit, stop_event=self.stop_event)
+            pipe = Pipeline(self.cfg, log=self.log.emit, stop_event=self.stop_event, api_key=self.api_key)
+            if self.project is not None:  # dịch lại dự án đã có – không đọc chữ / xoá chữ lại
+                pipe.project_path = self.project_path
+                pipe.source_name = self.project.get("source", "truyen")
+                self.stage.emit("Đang tải bộ dịch...")
+                pipe.load_models(need_ocr=False, need_clean=False)
+                self.stage.emit("Đang dịch...")
+                ok = pipe.retranslate(self.project, progress=self._prog, page_done=self.page_done.emit)
+                self.finished_ok.emit(ok, project_path)
+                return
             project_path = pipe.project_path
             self.stage.emit("Đang chuẩn bị trang...")
             pages = pipe.prepare_pages(self.source_type, self.source_path)
@@ -88,11 +112,40 @@ class Worker(QThread):
             self.stage.emit("Đang tải model (lần đầu có thể mất vài phút)...")
             pipe.load_models()
             self.stage.emit("Đang dịch...")
-            ok = pipe.run(pages, progress=self.progress.emit, page_done=self.page_done.emit)
+            ok = pipe.run(pages, progress=self._prog, page_done=self.page_done.emit)
             self.finished_ok.emit(ok, project_path)
         except Exception:  # noqa: BLE001
             self.log.emit("LỖI:\n" + traceback.format_exc())
             self.finished_ok.emit(False, project_path)
+
+
+class LlmProbe(QThread):
+    """Thử kết nối AI / lấy danh sách model (chạy nền)."""
+    done = Signal(bool, object, str)   # ok, danh sách model, thông báo
+
+    def __init__(self, provider, url, model, key, chat_test=False):
+        super().__init__()
+        self.args = (provider, url, model, key)
+        self.chat_test = chat_test
+
+    def run(self):
+        try:
+            c = LLMClient(*self.args, timeout=120)
+            models = []
+            try:
+                models = c.list_models()
+            except Exception:  # noqa: BLE001  (vài máy chủ không có /models)
+                if not self.chat_test:
+                    raise
+            msg = f"Kết nối được – {len(models)} model" if models else "Kết nối được"
+            if self.chat_test:
+                t0 = time.time()
+                rep = c.chat("Bạn là dịch giả.", "Dịch sang tiếng Việt, chỉ trả lời bản dịch: 你好，朋友")
+                rep = rep.split("</think>")[-1].strip()
+                msg = f"✅ AI trả lời sau {time.time() - t0:.1f}s: “{rep[:60]}”"
+            self.done.emit(True, models, msg)
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(False, [], "❌ " + friendly_error(e))
 
 
 class GpuProbe(QThread):
@@ -114,7 +167,9 @@ class MainWindow(QMainWindow):
         self.resize(1480, 900)
         self.setMinimumSize(1100, 680)
         self.setAcceptDrops(True)
-        self.settings = QSettings("DuyAnh", "DichTruyenTranh")
+        # cài đặt ở config.json (sửa tay được); lần đầu tự nhập cài đặt cũ từ registry
+        self.settings = JsonSettings(legacy=QSettings("DuyAnh", "DichTruyenTranh"))
+        self.llm_probe = None
         self.source_type = None
         self.source_path = None
         self.src_pages = []      # đường dẫn ảnh gốc theo thứ tự trang
@@ -273,22 +328,43 @@ class MainWindow(QMainWindow):
         for cb in (self.cb_lang, self.cb_engine, self.cb_device):
             cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumContentsLength(6)
+        self.cb_engine.currentIndexChanged.connect(self._engine_changed)
+        c.add(self._build_llm_box())
         self.chk_fallback = QCheckBox("Câu bỏ trống → GTX dịch bù (cần mạng)")
         self.chk_fallback.setChecked(True)
         c.add(self.chk_fallback)
+        gr = QHBoxLayout()
+        self.chk_glossary = QCheckBox("Dùng bảng thuật ngữ")
+        self.chk_glossary.setChecked(True)
+        self.chk_glossary.setToolTip("Tên riêng, xưng hô cố định cho AI; tự sửa chữ Việt sau khi dịch (mọi bộ dịch)")
+        b_gl = QPushButton("📖  Thuật ngữ")
+        b_gl.setToolTip("Mở bảng thuật ngữ (lưu trong data.db)")
+        b_gl.clicked.connect(self.open_glossary)
+        gr.addWidget(self.chk_glossary, 1)
+        gr.addWidget(b_gl)
+        c.add(gr)
         v.addWidget(c)
 
         # --- 3. chữ ---
         c = Card("Hiển thị chữ", icon="🔤")
-        self.ed_font = QLineEdit()
-        self.ed_font.setPlaceholderText("Font hỗ trợ tiếng Việt (.ttf)")
-        b_font = QPushButton("Chọn")
+        self.cb_font = QComboBox()
+        self.cb_font.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_font.setMinimumContentsLength(8)
+        for name, path in list_fonts():
+            self.cb_font.addItem(name, path)
+        self.cb_font.currentIndexChanged.connect(self._font_changed)
+        b_font = QPushButton("Khác…")
+        b_font.setToolTip("Chọn file font .ttf/.otf khác (nên có đủ dấu tiếng Việt)")
         b_font.clicked.connect(self.pick_font)
         fr = QHBoxLayout()
         fr.setSpacing(6)
-        fr.addWidget(self.ed_font, 1)
+        fr.addWidget(self.cb_font, 1)
         fr.addWidget(b_font)
         c.add(field("Font chữ", fr))
+        self.lbl_font_preview = QLabel("Ngươi vừa nói gì? Ầm ẦM!")
+        self.lbl_font_preview.setObjectName("fontPreview")
+        self.lbl_font_preview.setMinimumHeight(34)
+        c.add(self.lbl_font_preview)
         self.sl_scale = QSlider(Qt.Horizontal)
         self.sl_scale.setRange(30, 120)
         self.sl_scale.setSingleStep(5)
@@ -307,6 +383,11 @@ class MainWindow(QMainWindow):
         c.add(box)
         self.chk_upper = QCheckBox("Chữ IN HOA (kiểu truyện tranh)")
         c.add(self.chk_upper)
+        self.chk_lama = QCheckBox("Xoá chữ trên hình bằng AI (LaMa)")
+        self.chk_lama.setChecked(True)
+        self.chk_lama.setToolTip("Chữ nằm trên hình / nền lưới chấm được AI vẽ lại nền sạch sẽ.\n"
+                                 "Lần đầu tải model ~200 MB. Tắt thì dùng cách cũ (nhanh hơn, dễ nhoè).")
+        c.add(self.chk_lama)
         v.addWidget(c)
 
         # --- 4. xuất ---
@@ -337,6 +418,16 @@ class MainWindow(QMainWindow):
         self.chk_pdf = QCheckBox("Gộp các trang thành 1 file PDF")
         self.chk_pdf.setChecked(True)
         c.add(self.chk_pdf)
+        xr = QHBoxLayout()
+        self.chk_xlsx = QCheckBox("Excel lời thoại")
+        self.chk_xlsx.setChecked(True)
+        self.chk_xlsx.setToolTip("File .xlsx: trang, ô, loại, chữ gốc, bản dịch – để rà soát / chia sẻ nhóm dịch")
+        self.chk_psd = QCheckBox("PSD 3 lớp")
+        self.chk_psd.setToolTip("Mỗi trang 1 file PSD: Gốc / Nền sạch / Chữ dịch – sửa tiếp trong Photoshop")
+        xr.addWidget(self.chk_xlsx)
+        xr.addWidget(self.chk_psd)
+        xr.addStretch(1)
+        c.add(xr)
         v.addWidget(c)
 
         # --- 5. chạy + tiến độ ---
@@ -379,6 +470,57 @@ class MainWindow(QMainWindow):
         scroll.setWidget(inner)
         return scroll
 
+    def _build_llm_box(self):
+        box = QFrame()
+        box.setObjectName("subCard")
+        g = QGridLayout(box)
+        g.setContentsMargins(10, 10, 10, 10)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(8)
+        self.cb_provider = QComboBox()
+        for pid, (name, *_rest) in PROVIDERS.items():
+            self.cb_provider.addItem(name, pid)
+        self.cb_provider.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_provider.setMinimumContentsLength(6)
+        self.cb_provider.currentIndexChanged.connect(self._provider_changed)
+        self.ed_llm_url = QLineEdit()
+        self.cb_llm_model = QComboBox()
+        self.cb_llm_model.setEditable(True)
+        self.cb_llm_model.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_llm_model.setMinimumContentsLength(6)
+        b_models = QToolButton()
+        b_models.setText("⟳")
+        b_models.setToolTip("Lấy danh sách model từ máy chủ (Ollama / LM Studio...)")
+        b_models.clicked.connect(lambda: self._probe_llm(False))
+        mr = QHBoxLayout()
+        mr.setSpacing(6)
+        mr.addWidget(self.cb_llm_model, 1)
+        mr.addWidget(b_models)
+        self.ed_llm_key = QLineEdit()
+        self.ed_llm_key.setEchoMode(QLineEdit.Password)
+        self.ed_llm_key.setPlaceholderText("API key (lưu trong config.json trên máy này)")
+        self.ed_llm_style = QLineEdit()
+        self.ed_llm_style.setPlaceholderText("vd. cổ trang, xưng ta – ngươi; hoặc trẻ trung, học đường")
+        self.ed_llm_notes = QLineEdit()
+        self.ed_llm_notes.setPlaceholderText("vd. A là nữ, B là sư phụ của A...")
+        b_test = QPushButton("🔌  Thử kết nối AI")
+        b_test.clicked.connect(lambda: self._probe_llm(True))
+        self.lbl_llm = QLabel("")
+        self.lbl_llm.setObjectName("cardHint")
+        self.lbl_llm.setWordWrap(True)
+        g.addWidget(field("Nhà cung cấp AI", self.cb_provider), 0, 0, 1, 2)
+        g.addWidget(field("Địa chỉ máy chủ (URL)", self.ed_llm_url), 1, 0, 1, 2)
+        g.addWidget(field("Model", mr), 2, 0, 1, 2)
+        self.key_field = field("API key", self.ed_llm_key)
+        g.addWidget(self.key_field, 3, 0, 1, 2)
+        g.addWidget(field("Văn phong", self.ed_llm_style), 4, 0, 1, 2)
+        g.addWidget(field("Ghi chú về truyện (nhân vật, quan hệ)", self.ed_llm_notes), 5, 0, 1, 2)
+        g.addWidget(b_test, 6, 0, 1, 2)
+        g.addWidget(self.lbl_llm, 7, 0, 1, 2)
+        self.llm_box = box
+        box.setVisible(False)
+        return box
+
     def _build_pages(self):
         box = QWidget()
         box.setMinimumWidth(176)
@@ -411,33 +553,59 @@ class MainWindow(QMainWindow):
         ev = QVBoxLayout(edit)
         ev.setContentsMargins(8, 0, 8, 8)
         ev.setSpacing(8)
-        cap = QLabel("BẢN DỊCH CỦA TRANG – bấm đúp vào ô để sửa")
+        cap = QLabel("BẢN DỊCH CỦA TRANG – bấm đúp để sửa  •  tick 'Giữ' để giữ nguyên chữ gốc (logo, SFX...)")
         cap.setObjectName("viewCaption")
         ev.addWidget(cap)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["#", "Chữ gốc (OCR)", "Bản dịch"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["#", "Loại", "Giữ", "Chữ gốc (OCR)", "Bản dịch"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        for col in (0, 1, 2):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
         self.table.setWordWrap(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         ev.addWidget(self.table, 1)
         row = QHBoxLayout()
         b_apply = QPushButton("💾  Lưu bản sửa && vẽ lại trang")
         b_apply.clicked.connect(self.apply_edits)
-        b_redraw_all = QPushButton("🎨  Vẽ lại tất cả (font / cỡ chữ / in hoa)")
+        b_redraw_all = QPushButton("🎨  Vẽ lại tất cả")
+        b_redraw_all.setToolTip("Vẽ lại mọi trang sau khi đổi font / cỡ chữ / in hoa – không cần dịch lại")
         b_redraw_all.clicked.connect(self.redraw_all)
+        self.b_retrans = QPushButton("🔁  Dịch lại cả chương")
+        self.b_retrans.setToolTip("Dịch lại mọi ô bằng bộ dịch đang chọn (vd. sau khi sửa bảng thuật ngữ\n"
+                                  "hoặc đổi sang AI) – không đọc chữ / xoá chữ lại")
+        self.b_retrans.clicked.connect(self.retranslate)
         row.addWidget(b_apply)
         row.addWidget(b_redraw_all)
+        row.addWidget(self.b_retrans)
         row.addStretch(1)
         ev.addLayout(row)
         split.addWidget(edit)
         split.setSizes([620, 250])
         vv.addWidget(split)
         self.tabs.addTab(view, "🖼  Xem && sửa")
+        # --- tab tình trạng ---
+        stw = QWidget()
+        sv = QVBoxLayout(stw)
+        sv.setContentsMargins(8, 8, 8, 8)
+        self.lbl_status_tab = QLabel("Chưa có dữ liệu – dịch xong sẽ liệt kê các ô cần xem lại.")
+        self.lbl_status_tab.setObjectName("cardHint")
+        sv.addWidget(self.lbl_status_tab)
+        self.status_table = QTableWidget(0, 4)
+        self.status_table.setHorizontalHeaderLabels(["Trang", "Ô", "Vấn đề", "Chữ gốc → bản dịch"])
+        self.status_table.verticalHeader().setVisible(False)
+        self.status_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.status_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        sh = self.status_table.horizontalHeader()
+        for col in (0, 1, 2):
+            sh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        sh.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.status_table.cellDoubleClicked.connect(self._goto_issue)
+        sv.addWidget(self.status_table, 1)
+        self.tabs.addTab(stw, "✅  Tình trạng")
         # --- tab nhật ký ---
         logw = QWidget()
         lv = QVBoxLayout(logw)
@@ -452,7 +620,7 @@ class MainWindow(QMainWindow):
     def log(self, msg):
         self.log_box.appendPlainText(msg)
         if msg.startswith("LỖI") or msg.startswith("! "):
-            self.tabs.setTabText(1, "📜  Nhật ký  ⚠")
+            self.tabs.setTabText(TAB_LOG, "📜  Nhật ký  ⚠")
 
     # ---------------- GPU & cập nhật ----------------
     def _on_gpu(self, has, info):
@@ -495,33 +663,135 @@ class MainWindow(QMainWindow):
         self._set_combo(self.cb_lang, s.value("lang", "zh"))
         self._set_combo(self.cb_device, s.value("device", "auto"))
         self._fill_engines()
-        self.chk_fallback.setChecked(str(s.value("gtx_fallback", "true")) == "true")
+        self.chk_fallback.setChecked(s.get_bool("gtx_fallback", True))
+        self.chk_glossary.setChecked(s.get_bool("use_glossary", True))
+        self.chk_lama.setChecked(s.get_bool("use_lama", True))
         font = s.value("font", "") or ""
-        self.ed_font.setText(font if font and Path(font).exists() else find_default_font())
-        self.chk_upper.setChecked(str(s.value("upper", "false")) == "true")
-        try:
-            self.sl_scale.setValue(int(s.value("font_scale", 70)))
-        except (TypeError, ValueError):
-            self.sl_scale.setValue(70)
-        try:
-            self.sp_dpi.setValue(int(s.value("dpi", 200)))
-        except (TypeError, ValueError):
-            self.sp_dpi.setValue(200)
+        self._set_font_path(font if font and Path(font).exists() else find_default_font())
+        self.chk_upper.setChecked(s.get_bool("upper", False))
+        self.sl_scale.setValue(s.get_int("font_scale", 70))
+        self.sp_dpi.setValue(s.get_int("dpi", 200))
         self.cb_fmt.setCurrentText(s.value("fmt", "jpg"))
-        self.chk_pdf.setChecked(str(s.value("pdf", "true")) == "true")
+        self.chk_pdf.setChecked(s.get_bool("pdf", True))
+        self.chk_xlsx.setChecked(s.get_bool("export_xlsx", True))
+        self.chk_psd.setChecked(s.get_bool("export_psd", False))
+        self._set_combo(self.cb_provider, s.value("llm_provider", "ollama"))
+        self._provider_changed()
+        self.ed_llm_style.setText(s.value("llm_style", ""))
+        self.ed_llm_notes.setText(s.value("llm_notes", ""))
+        self._engine_changed()
 
     def _save_settings(self):
         s = self.settings
         s.setValue("lang", self.cb_lang.currentData())
         s.setValue("device", self.cb_device.currentData())
         s.setValue(f"engine_{self.cb_lang.currentData()}", self.cb_engine.currentData())
-        s.setValue("gtx_fallback", "true" if self.chk_fallback.isChecked() else "false")
-        s.setValue("font", self.ed_font.text())
-        s.setValue("upper", "true" if self.chk_upper.isChecked() else "false")
+        s.setValue("gtx_fallback", self.chk_fallback.isChecked())
+        s.setValue("use_glossary", self.chk_glossary.isChecked())
+        s.setValue("use_lama", self.chk_lama.isChecked())
+        s.setValue("font", self._font_path())
+        s.setValue("upper", self.chk_upper.isChecked())
         s.setValue("font_scale", self.sl_scale.value())
         s.setValue("dpi", self.sp_dpi.value())
         s.setValue("fmt", self.cb_fmt.currentText())
-        s.setValue("pdf", "true" if self.chk_pdf.isChecked() else "false")
+        s.setValue("pdf", self.chk_pdf.isChecked())
+        s.setValue("export_xlsx", self.chk_xlsx.isChecked())
+        s.setValue("export_psd", self.chk_psd.isChecked())
+        self._store_provider_fields()
+        s.setValue("llm_provider", self.cb_provider.currentData())
+        s.setValue("llm_style", self.ed_llm_style.text().strip())
+        s.setValue("llm_notes", self.ed_llm_notes.text().strip())
+        try:
+            s.save()
+        except OSError as e:
+            self.log(f"! Không lưu được config.json: {e}")
+
+    # ---- AI (LLM): mỗi nhà cung cấp nhớ URL / model / key riêng ----
+    def _store_provider_fields(self):
+        pid = getattr(self, "_cur_provider", None)
+        if not pid:
+            return
+        llm = dict(self.settings.value("llm", {}) or {})
+        llm[pid] = {"url": self.ed_llm_url.text().strip(), "model": self.cb_llm_model.currentText().strip(),
+                    "key": self.ed_llm_key.text().strip()}
+        self.settings.setValue("llm", llm)
+
+    def _provider_changed(self):
+        self._store_provider_fields()
+        pid = self.cb_provider.currentData()
+        name, def_url, def_model, need_key, _api = PROVIDERS[pid]
+        saved = (self.settings.value("llm", {}) or {}).get(pid, {})
+        self.ed_llm_url.setText(saved.get("url") or def_url)
+        self.cb_llm_model.clear()
+        self.cb_llm_model.setEditText(saved.get("model") or def_model)
+        self.ed_llm_key.setText(saved.get("key", ""))
+        self.key_field.setVisible(need_key or pid == "custom")
+        local = pid in ("ollama", "lmstudio")
+        self.lbl_llm.setText(
+            "Chạy trên máy, miễn phí: mở Ollama / LM Studio và tải sẵn model (gợi ý Qwen2.5 7B–14B cho "
+            "card 12 GB). Bấm ⟳ để lấy danh sách model." if local else
+            "Cần API key của bạn – chữ trong truyện được gửi lên máy chủ của nhà cung cấp để dịch.")
+        self._cur_provider = pid
+
+    def _engine_changed(self):
+        is_llm = self.cb_engine.currentData() == "llm"
+        self.llm_box.setVisible(is_llm)
+        self.chk_fallback.setText("Câu AI bỏ sót → GTX dịch bù (cần mạng)" if is_llm
+                                  else "Câu bỏ trống → GTX dịch bù (cần mạng)")
+
+    def _probe_llm(self, chat_test):
+        if self.llm_probe is not None and self.llm_probe.isRunning():
+            return
+        self.lbl_llm.setText("⏳ Đang kết nối..." if not chat_test
+                             else "⏳ Đang hỏi thử AI (model chạy máy có thể mất 10–60 giây)...")
+        self.llm_probe = LlmProbe(self.cb_provider.currentData(), self.ed_llm_url.text(),
+                                  self.cb_llm_model.currentText(), self.ed_llm_key.text(), chat_test)
+        self.llm_probe.done.connect(self._on_llm_probe)
+        self.llm_probe.start()
+
+    def _on_llm_probe(self, ok, models, msg):
+        self.lbl_llm.setText(msg)
+        if ok and models:
+            cur = self.cb_llm_model.currentText()
+            self.cb_llm_model.clear()
+            self.cb_llm_model.addItems(models)
+            self.cb_llm_model.setEditText(cur if cur else models[0])
+
+    def open_glossary(self):
+        GlossaryDialog(self).exec()
+
+    # ---- font ----
+    def _font_path(self) -> str:
+        return self.cb_font.currentData() or ""
+
+    def _set_font_path(self, path):
+        if not path:
+            return
+        i = self.cb_font.findData(path)
+        if i < 0:
+            self.cb_font.addItem(f"📄 {Path(path).name}", path)
+            i = self.cb_font.count() - 1
+        self.cb_font.setCurrentIndex(i)
+        self._font_changed()
+
+    def _font_changed(self):
+        path = self._font_path()
+        if not path or not Path(path).exists():
+            return
+        fid = QFontDatabase.addApplicationFont(path)
+        fams = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
+        # stylesheet chung của app đè setFont() -> đặt font riêng bằng stylesheet của nhãn
+        fam = fams[0].replace("'", "") if fams else ""
+        self.lbl_font_preview.setStyleSheet(f"font-family: '{fam}'; font-size: 21px;" if fam else "")
+        miss = vi_missing(path)
+        if miss:
+            self.lbl_font_preview.setText(f"⚠ Font thiếu {len(miss)} chữ có dấu: {miss[:10]}…")
+            self.lbl_font_preview.setProperty("warn", True)
+        else:
+            self.lbl_font_preview.setText("Ngươi vừa nói gì? Ầm ẦM!")
+            self.lbl_font_preview.setProperty("warn", False)
+        self.lbl_font_preview.style().unpolish(self.lbl_font_preview)
+        self.lbl_font_preview.style().polish(self.lbl_font_preview)
 
     def _fill_engines(self):
         lang = self.cb_lang.currentData() or "zh"
@@ -531,6 +801,8 @@ class MainWindow(QMainWindow):
             self.cb_engine.addItem(t, d)
         self._set_combo(self.cb_engine, self.settings.value(f"engine_{lang}", default_engine(lang)))
         self.cb_engine.blockSignals(False)
+        if hasattr(self, "llm_box"):
+            self._engine_changed()
 
     @staticmethod
     def _set_combo(cb, data):
@@ -544,7 +816,16 @@ class MainWindow(QMainWindow):
             device=self.cb_device.currentData(),
             engine=self.cb_engine.currentData() or default_engine(self.cb_lang.currentData()),
             gtx_fallback=self.chk_fallback.isChecked(),
-            font_path=self.ed_font.text().strip(),
+            use_lama=self.chk_lama.isChecked(),
+            use_glossary=self.chk_glossary.isChecked(),
+            llm_provider=self.cb_provider.currentData(),
+            llm_url=self.ed_llm_url.text().strip(),
+            llm_model=self.cb_llm_model.currentText().strip(),
+            llm_style=self.ed_llm_style.text().strip(),
+            llm_notes=self.ed_llm_notes.text().strip(),
+            export_xlsx=self.chk_xlsx.isChecked(),
+            export_psd=self.chk_psd.isChecked(),
+            font_path=self._font_path(),
             uppercase=self.chk_upper.isChecked(),
             font_scale=self.sl_scale.value(),
             pdf_dpi=self.sp_dpi.value(),
@@ -684,10 +965,16 @@ class MainWindow(QMainWindow):
                 self._thumb_timer.start(15)
 
     def pick_font(self):
-        start = str(Path(self.ed_font.text()).parent) if self.ed_font.text() else r"C:\Windows\Fonts"
+        cur = self._font_path()
+        start = str(Path(cur).parent) if cur else r"C:\Windows\Fonts"
         f, _ = QFileDialog.getOpenFileName(self, "Chọn font hỗ trợ tiếng Việt", start, "Font (*.ttf *.otf *.ttc)")
         if f:
-            self.ed_font.setText(f)
+            self._set_font_path(f)
+            miss = vi_missing(f)
+            if miss:
+                QMessageBox.warning(self, "Font thiếu dấu",
+                                    f"Font này thiếu {len(miss)} chữ có dấu tiếng Việt ({miss[:20]}...).\n"
+                                    "Chữ dịch có thể hiện ô vuông – nên chọn font khác.")
 
     def pick_out(self):
         d = QFileDialog.getExistingDirectory(self, "Chọn thư mục kết quả", self.ed_out.text() or self._last_dir())
@@ -713,6 +1000,8 @@ class MainWindow(QMainWindow):
         if cfg.font_path and not Path(cfg.font_path).exists():
             QMessageBox.warning(self, "Font", "Không tìm thấy file font đã chọn.")
             return
+        if not self._check_llm(cfg):
+            return
         self._save_settings()
         self.done_pages = {}
         self._fill_page_list()
@@ -723,8 +1012,25 @@ class MainWindow(QMainWindow):
         self.lbl_progress.setText("Đang khởi động...")
         self._t_start = None
         self.log_box.clear()
-        self.tabs.setTabText(1, "📜  Nhật ký")
-        self.worker = Worker(cfg, self.source_type, self.source_path)
+        self.tabs.setTabText(TAB_LOG, "📜  Nhật ký")
+        self.worker = Worker(cfg, self.source_type, self.source_path, api_key=self.ed_llm_key.text().strip())
+        self._wire_worker()
+        self.worker.start()
+
+    def _check_llm(self, cfg) -> bool:
+        if cfg.engine != "llm":
+            return True
+        need_key = PROVIDERS[cfg.llm_provider][3]
+        if need_key and not self.ed_llm_key.text().strip():
+            QMessageBox.information(self, "Thiếu API key", "Nhập API key của nhà cung cấp AI đã chọn "
+                                    "(hoặc chọn Ollama / LM Studio chạy trên máy).")
+            return False
+        if not cfg.llm_model:
+            QMessageBox.information(self, "Thiếu model", "Nhập tên model AI (bấm ⟳ để lấy danh sách).")
+            return False
+        return True
+
+    def _wire_worker(self):
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self._on_progress)
         self.worker.stage.connect(self._on_stage)
@@ -732,9 +1038,9 @@ class MainWindow(QMainWindow):
         self.worker.page_done.connect(self._on_page_done)
         self.worker.finished_ok.connect(self._on_finished)
         self.b_start.setEnabled(False)
+        self.b_retrans.setEnabled(False)
         self.b_start.setText("⏳   ĐANG DỊCH...")
         self.b_stop.setEnabled(True)
-        self.worker.start()
 
     def stop(self):
         if self.worker and self.worker.isRunning():
@@ -751,23 +1057,25 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, n)
             self.progress.setValue(0)
             self.lbl_pct.setText("0%")
-            self.lbl_progress.setText(f"Đang dịch... 0/{len(self.src_pages)} trang")
+            self.lbl_progress.setText("Đang dịch...")
 
     @staticmethod
     def _fmt_time(sec):
         sec = int(max(0, sec))
         return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
 
-    def _on_progress(self, i, n):
+    def _on_progress(self, i, n, text=""):
         self.progress.setRange(0, max(1, n))
         self.progress.setValue(i)
         pct = 100 * i / max(1, n)
         self.lbl_pct.setText(f"{pct:.0f}%")
         el = time.time() - (self._t_start or time.time())
-        txt = f"Trang {i}/{n}"
+        txt = text or f"Trang {i}/{n}"
         if i > 0:
             per = el / i
-            txt += f"  •  {per:.1f}s/trang  •  đã chạy {self._fmt_time(el)}"
+            if not text or text.startswith("Trang"):
+                txt += f"  •  {per:.1f}s/trang"
+            txt += f"  •  đã chạy {self._fmt_time(el)}"
             self.lbl_eta.setText(f"còn ~{self._fmt_time(per * (n - i))}")
         self.lbl_progress.setText(txt)
         self.setWindowTitle(f"[{pct:.0f}%] {self.base_title}")
@@ -784,6 +1092,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, ok, project_path):
         self.b_start.setEnabled(True)
+        self.b_retrans.setEnabled(True)
         self.b_start.setText("▶   BẮT ĐẦU DỊCH")
         self.b_stop.setEnabled(False)
         if self.progress.maximum() == 0:
@@ -804,10 +1113,11 @@ class MainWindow(QMainWindow):
                     self.done_pages[p["index"]] = p
             except Exception as e:  # noqa: BLE001
                 self.log(f"! Không đọc được project.json: {e}")
+        self._refresh_status()
         if ok and self.done_pages:
             self.lbl_status.setText(f"✅ Hoàn tất {len(self.done_pages)} trang → {self.ed_out.text()}")
         elif not ok:
-            self.tabs.setCurrentIndex(1) if "LỖI" in self.log_box.toPlainText()[-4000:] else None
+            self.tabs.setCurrentIndex(TAB_LOG) if "LỖI" in self.log_box.toPlainText()[-4000:] else None
 
     # ---------------- xem & sửa ----------------
     def show_page(self, i):
@@ -819,16 +1129,30 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         if not page:
             return
+        warn_bg, miss_bg = QColor("#3a2e10"), QColor("#3a1820")
         for k, b in enumerate(page["blocks"]):
             self.table.insertRow(k)
             num = QTableWidgetItem(str(k + 1))
-            num.setFlags(num.flags() & ~Qt.ItemIsEditable)
             num.setTextAlignment(Qt.AlignCenter)
+            kind = QTableWidgetItem(KIND_VI.get(b.get("kind", ""), "–"))
+            keep = QTableWidgetItem()
+            keep.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            keep.setCheckState(Qt.Checked if b.get("keep") else Qt.Unchecked)
+            keep.setToolTip("Giữ nguyên chữ gốc (không dịch, không xoá)")
             orig = QTableWidgetItem(b["text"])
-            orig.setFlags(orig.flags() & ~Qt.ItemIsEditable)
-            self.table.setItem(k, 0, num)
-            self.table.setItem(k, 1, orig)
-            self.table.setItem(k, 2, QTableWidgetItem(b["translation"]))
+            for it in (num, kind, orig):
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            tr = QTableWidgetItem(b["translation"])
+            if b.get("overflow"):
+                tr.setToolTip("Chữ dịch quá dài so với bóng thoại – nên rút gọn")
+                for it in (num, tr):
+                    it.setBackground(warn_bg)
+            elif not b.get("translation") and not b.get("keep"):
+                tr.setToolTip("Chưa dịch – gõ bản dịch rồi bấm Lưu")
+                for it in (num, tr):
+                    it.setBackground(miss_bg)
+            for c, it in enumerate((num, kind, keep, orig, tr)):
+                self.table.setItem(k, c, it)
         self.table.resizeRowsToContents()
 
     def _project_page(self, i):
@@ -849,9 +1173,12 @@ class MainWindow(QMainWindow):
             return
         self.table.setCurrentCell(-1, -1)  # chốt ô đang gõ dở
         for k, b in enumerate(page["blocks"]):
-            item = self.table.item(k, 2)
+            item = self.table.item(k, 4)
             if item is not None:
                 b["translation"] = item.text()
+            keep = self.table.item(k, 2)
+            if keep is not None:
+                b["keep"] = keep.checkState() == Qt.Checked
         if self._redraw([page]):
             self.lbl_status.setText(f"Đã vẽ lại trang {i + 1}.")
 
@@ -863,7 +1190,7 @@ class MainWindow(QMainWindow):
 
     def _redraw(self, pages) -> bool:
         self._save_settings()
-        font, upper, scale = self.ed_font.text().strip(), self.chk_upper.isChecked(), self.sl_scale.value()
+        font, upper, scale = self._font_path(), self.chk_upper.isChecked(), self.sl_scale.value()
         ok = True
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -874,18 +1201,19 @@ class MainWindow(QMainWindow):
             self.project["config"]["font_path"] = font
             self.project["config"]["uppercase"] = upper
             self.project["config"]["font_scale"] = scale
+            self.project["config"]["export_xlsx"] = self.chk_xlsx.isChecked()
+            self.project["config"]["export_psd"] = self.chk_psd.isChecked()
             save_project(self.project, self.project_path)
-            out_dir = Path(self.project_path).parent.parent
-            write_text_export(self.project, out_dir / "ban_dich.txt")
-            if self.project["config"].get("export_pdf"):
-                export_pdf([p["out"] for p in self.project["pages"]],
-                           out_dir / f"{self.project.get('source', 'truyen')}_vi.pdf")
+            from core.exporter import export_extras
+
+            export_extras(self.project, Path(self.project_path).parent.parent, self.project["config"], self.log)
         except Exception:  # noqa: BLE001
             ok = False
             self.log("LỖI:\n" + traceback.format_exc())
         finally:
             QApplication.restoreOverrideCursor()
         self.show_page(self.page_list.currentRow())
+        self._refresh_status()
         return ok
 
     def open_project(self):
@@ -914,7 +1242,7 @@ class MainWindow(QMainWindow):
         self._set_combo(self.cb_lang, cfg.src_lang)
         self._set_combo(self.cb_engine, cfg.engine)
         if cfg.font_path and Path(cfg.font_path).exists():
-            self.ed_font.setText(cfg.font_path)
+            self._set_font_path(cfg.font_path)
         self.chk_upper.setChecked(cfg.uppercase)
         self.sl_scale.setValue(int(cfg.font_scale))
         self.chk_pdf.setChecked(cfg.export_pdf)
@@ -922,6 +1250,76 @@ class MainWindow(QMainWindow):
         self.source_type, self.source_path = None, None
         self._set_source_label(f"🗂  <b>Dự án: {proj.get('source', '')}</b><br>{len(self.done_pages)} trang đã dịch")
         self._fill_page_list()
+        self._refresh_status()
+
+    def retranslate(self):
+        if self._busy():
+            return
+        if not self.project or not self.project_path:
+            QMessageBox.information(self, "Chưa có bản dịch", "Hãy dịch một truyện (hoặc mở Dự án cũ) trước.")
+            return
+        cfg = self._config()
+        cfg.out_dir = str(Path(self.project_path).parent.parent)
+        if not self._check_llm(cfg):
+            return
+        name = self.cb_engine.currentText()
+        if QMessageBox.question(self, "Dịch lại cả chương",
+                                f"Dịch lại {len(self.project['pages'])} trang bằng:\n{name}\n\n"
+                                "Mọi bản dịch (kể cả đã sửa tay) sẽ được thay mới. Tiếp tục?") != QMessageBox.Yes:
+            return
+        self._save_settings()
+        self.progress.setRange(0, 0)
+        self.lbl_pct.setText("…")
+        self.lbl_eta.setText("")
+        self._t_start = None
+        self.worker = Worker(cfg, api_key=self.ed_llm_key.text().strip(), project=self.project,
+                             project_path=self.project_path)
+        self._wire_worker()
+        self.worker.start()
+
+    def _refresh_status(self):
+        """Tab Tình trạng: liệt kê ô chưa dịch / chữ tràn khung để xem lại nhanh."""
+        rows = []
+        pages = sorted(self.done_pages.values(), key=lambda p: p["index"])
+        total = 0
+        for p in pages:
+            for k, b in enumerate(p.get("blocks", [])):
+                total += 1
+                if b.get("keep"):
+                    continue
+                if not b.get("translation"):
+                    rows.append((p["index"], k, "❌ Chưa dịch", b.get("text", "")))
+                elif b.get("overflow"):
+                    rows.append((p["index"], k, "⚠ Chữ tràn khung", f"{b.get('text', '')}  →  {b['translation']}"))
+        self.status_table.setRowCount(0)
+        for r, (pi, k, what, txt) in enumerate(rows):
+            self.status_table.insertRow(r)
+            for c, val in enumerate((str(pi + 1), str(k + 1), what, txt)):
+                it = QTableWidgetItem(val)
+                it.setData(Qt.UserRole, (pi, k))
+                self.status_table.setItem(r, c, it)
+        if not pages:
+            self.lbl_status_tab.setText("Chưa có dữ liệu – dịch xong sẽ liệt kê các ô cần xem lại.")
+            self.tabs.setTabText(TAB_STATUS, "✅  Tình trạng")
+        elif rows:
+            self.lbl_status_tab.setText(f"{len(rows)}/{total} ô cần xem lại – bấm đúp để mở đúng trang, "
+                                        "sửa bản dịch (rút gọn câu dài) rồi bấm Lưu.")
+            self.tabs.setTabText(TAB_STATUS, f"⚠  Tình trạng ({len(rows)})")
+        else:
+            self.lbl_status_tab.setText(f"✅ Tốt – {total} ô đều đã dịch và vừa khung.")
+            self.tabs.setTabText(TAB_STATUS, "✅  Tình trạng")
+
+    def _goto_issue(self, row, _col):
+        it = self.status_table.item(row, 0)
+        if it is None:
+            return
+        pi, k = it.data(Qt.UserRole)
+        self.page_list.setCurrentRow(pi)
+        self.show_page(pi)
+        self.tabs.setCurrentIndex(TAB_VIEW)
+        if k < self.table.rowCount():
+            self.table.selectRow(k)
+            self.table.scrollToItem(self.table.item(k, 4))
 
     def open_out(self):
         d = self.ed_out.text().strip()
@@ -939,7 +1337,7 @@ class MainWindow(QMainWindow):
             self.worker.stop_event.set()
             if not self.worker.wait(8000):
                 os._exit(0)  # luồng đang tải model / gọi mạng -> thoát cứng cho khỏi treo
-        for th in (self.probe, self.checker):
+        for th in (self.probe, self.checker, self.llm_probe):
             if th is not None and th.isRunning():
                 th.wait(3000)
         super().closeEvent(e)
@@ -969,10 +1367,17 @@ def _screenshot(win, path, demo):
         outs = sorted(Path(demo).parent.glob("demo_out/*.png"))
         for i, o in enumerate(outs[:len(win.src_pages)]):
             win.done_pages[i] = {"index": i, "src": win.src_pages[i], "out": str(o), "blocks": [
-                {"text": "他必须得抓紧时间了。", "translation": "Hắn phải tranh thủ thời gian rồi."},
-                {"text": "你说什么?", "translation": "Ngươi vừa nói cái gì vậy hả?"}]}
+                {"text": "他必须得抓紧时间了。", "translation": "Hắn phải tranh thủ thời gian rồi.", "kind": "speech"},
+                {"text": "你说什么?", "translation": "Ngươi vừa nói cái gì vậy hả?", "kind": "shout",
+                 "overflow": i == 1},
+                {"text": "轰隆", "translation": "", "kind": "sfx", "keep": i != 2}]}
             win._refresh_item(i)
         win.show_page(0)
+        win._refresh_status()
+        if os.environ.get("DTT_DEMO_LLM"):
+            win._set_combo(win.cb_engine, "llm")
+        if os.environ.get("DTT_DEMO_TAB"):
+            win.tabs.setCurrentIndex(int(os.environ["DTT_DEMO_TAB"]))
 
     def grab():
         QApplication.processEvents()
