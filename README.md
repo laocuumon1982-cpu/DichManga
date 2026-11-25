@@ -44,7 +44,7 @@ Bấm nút **⟳ Cập nhật** ở góc trên app. App tự kiểm tra bản m�
   | Anh | **GTX Google** |
   | Tất cả | **🤖 AI (LLM)** – dịch cả chương theo ngữ cảnh · GTX Google (online, miễn phí, dịch bù câu bị bỏ trống) |
 - **🆕 AI dịch cả chương theo ngữ cảnh** (v2.1): gom chữ mọi trang rồi gửi một lượt cho AI, kèm **bảng thuật ngữ**, **văn phong** và **ghi chú truyện** → tên riêng, xưng hô thống nhất cả chương.
-  - **Chạy trên máy, miễn phí**: [Ollama](https://ollama.com) hoặc [LM Studio](https://lmstudio.ai) (gợi ý Qwen2.5 7B–14B cho card 12 GB) – không gửi truyện ra ngoài.
+  - **Chạy trên máy, miễn phí**: [Ollama](https://ollama.com) hoặc [LM Studio](https://lmstudio.ai) (gợi ý Qwen2.5 7B–14B cho card 12 GB) – không gửi truyện ra ngoài. Với Ollama app **tự mở Ollama, tự chọn model đã cài**, chưa có model thì bấm **⬇ Tải model** ngay trong app.
   - **Online** (API key của bạn): DeepSeek, Google Gemini, OpenAI, Anthropic Claude, hoặc máy chủ kiểu OpenAI khác.
   - Nút **⟳** lấy danh sách model, **🔌 Thử kết nối AI**; câu AI bỏ sót tự hỏi lại rồi GTX dịch bù.
 - **🆕 Bảng thuật ngữ** (📖 Thuật ngữ): tên riêng / xưng hô cố định cho AI; dòng có chữ gốc là tiếng Việt thì **tự sửa sau khi dịch** với mọi bộ dịch. Nhập / xuất CSV.

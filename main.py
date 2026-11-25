@@ -24,7 +24,7 @@ setup_env()  # phải chạy trước khi import PySide6 / torch
 from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal  # noqa: E402
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QPixmap  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QMenu,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
     QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
@@ -34,6 +34,7 @@ from core.loader import IMG_EXT, export_pdf, list_images, pdf_page_count  # noqa
 from core.pipeline import (Config, Pipeline, default_engine, gpu_info, load_project,  # noqa: E402
                            rerender_page, save_project, write_text_export)
 from core.fonts import list_fonts, vi_missing  # noqa: E402
+from core import ollama as OL  # noqa: E402
 from core.llm import PROVIDERS, LLMClient, friendly_error  # noqa: E402
 from core.store import JsonSettings  # noqa: E402
 from core.typeset import KIND_VI, find_default_font  # noqa: E402
@@ -119,6 +120,42 @@ class Worker(QThread):
             self.finished_ok.emit(False, project_path)
 
 
+class OllamaAuto(QThread):
+    """Tự kết nối Ollama: mở nếu chưa chạy, liệt kê model đã cài, chọn model hợp nhất."""
+    done = Signal(object)
+
+    def __init__(self, url, model):
+        super().__init__()
+        self.url, self.model = url, model
+
+    def run(self):
+        try:
+            self.done.emit(OL.auto_connect(self.url, self.model, log=lambda m: None))
+        except Exception as e:  # noqa: BLE001
+            self.done.emit({"ok": False, "models": [], "model": "", "message": friendly_error(e)})
+
+
+class OllamaPull(QThread):
+    """Tải model về Ollama, báo % tiến độ."""
+    progress = Signal(float, str)   # -1 = chưa biết %
+    done = Signal(bool, str)
+
+    def __init__(self, url, model):
+        super().__init__()
+        self.url, self.model = url, model
+        self.stop_event = threading.Event()
+
+    def run(self):
+        try:
+            if not OL.start_server(self.url, log=lambda m: None):
+                raise RuntimeError("Không mở được Ollama – hãy cài / mở Ollama trước")
+            OL.pull(self.url, self.model, lambda pct, txt: self.progress.emit(-1.0 if pct is None else pct, txt),
+                    self.stop_event)
+            self.done.emit(True, f"✅ Đã tải xong {self.model}")
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(False, f"❌ Tải {self.model} lỗi: {friendly_error(e)}")
+
+
 class LlmProbe(QThread):
     """Thử kết nối AI / lấy danh sách model (chạy nền)."""
     done = Signal(bool, object, str)   # ok, danh sách model, thông báo
@@ -170,6 +207,9 @@ class MainWindow(QMainWindow):
         # cài đặt ở config.json (sửa tay được); lần đầu tự nhập cài đặt cũ từ registry
         self.settings = JsonSettings(legacy=QSettings("DuyAnh", "DichTruyenTranh"))
         self.llm_probe = None
+        self.ollama_auto = None
+        self.ollama_pull = None
+        self._ollama_connected = False
         self.source_type = None
         self.source_path = None
         self.src_pages = []      # đường dẫn ảnh gốc theo thứ tự trang
@@ -183,6 +223,7 @@ class MainWindow(QMainWindow):
         self.update_info = None
         self._build_ui()
         self._load_settings()
+        QTimer.singleShot(400, self._maybe_auto_ollama)  # đang chọn AI + Ollama -> tự kết nối luôn
         self.probe = GpuProbe()
         self.probe.done.connect(self._on_gpu)
         QTimer.singleShot(200, self.probe.start)
@@ -490,8 +531,8 @@ class MainWindow(QMainWindow):
         self.cb_llm_model.setMinimumContentsLength(6)
         b_models = QToolButton()
         b_models.setText("⟳")
-        b_models.setToolTip("Lấy danh sách model từ máy chủ (Ollama / LM Studio...)")
-        b_models.clicked.connect(lambda: self._probe_llm(False))
+        b_models.setToolTip("Kết nối lại & lấy danh sách model (Ollama: tự mở Ollama, tự chọn model đã cài)")
+        b_models.clicked.connect(self._refresh_models)
         mr = QHBoxLayout()
         mr.setSpacing(6)
         mr.addWidget(self.cb_llm_model, 1)
@@ -503,8 +544,26 @@ class MainWindow(QMainWindow):
         self.ed_llm_style.setPlaceholderText("vd. cổ trang, xưng ta – ngươi; hoặc trẻ trung, học đường")
         self.ed_llm_notes = QLineEdit()
         self.ed_llm_notes.setPlaceholderText("vd. A là nữ, B là sư phụ của A...")
-        b_test = QPushButton("🔌  Thử kết nối AI")
+        b_test = QPushButton("🔌  Thử dịch")
+        b_test.setToolTip("Gửi 1 câu thử để chắc chắn AI dịch được")
         b_test.clicked.connect(lambda: self._probe_llm(True))
+        self.b_pull = QToolButton()
+        self.b_pull.setText("⬇  Tải model")
+        self.b_pull.setToolTip("Tải model về Ollama (gợi ý cho card 12 GB)")
+        self.b_pull.setPopupMode(QToolButton.InstantPopup)
+        self.b_pull.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        menu = QMenu(self.b_pull)
+        for name, size, desc in OL.RECOMMENDED:
+            act = menu.addAction(f"{name}   ({size}) – {desc}")
+            act.triggered.connect(lambda _=False, n=name: self._pull_model(n))
+        self.b_pull.setMenu(menu)
+        self.pull_bar = QProgressBar()
+        self.pull_bar.setTextVisible(True)
+        self.pull_bar.setVisible(False)
+        tr = QHBoxLayout()
+        tr.setSpacing(6)
+        tr.addWidget(self.b_pull, 1)
+        tr.addWidget(b_test, 1)
         self.lbl_llm = QLabel("")
         self.lbl_llm.setObjectName("cardHint")
         self.lbl_llm.setWordWrap(True)
@@ -515,8 +574,9 @@ class MainWindow(QMainWindow):
         g.addWidget(self.key_field, 3, 0, 1, 2)
         g.addWidget(field("Văn phong", self.ed_llm_style), 4, 0, 1, 2)
         g.addWidget(field("Ghi chú về truyện (nhân vật, quan hệ)", self.ed_llm_notes), 5, 0, 1, 2)
-        g.addWidget(b_test, 6, 0, 1, 2)
-        g.addWidget(self.lbl_llm, 7, 0, 1, 2)
+        g.addLayout(tr, 6, 0, 1, 2)
+        g.addWidget(self.pull_bar, 7, 0, 1, 2)
+        g.addWidget(self.lbl_llm, 8, 0, 1, 2)
         self.llm_box = box
         box.setVisible(False)
         return box
@@ -726,18 +786,96 @@ class MainWindow(QMainWindow):
         self.cb_llm_model.setEditText(saved.get("model") or def_model)
         self.ed_llm_key.setText(saved.get("key", ""))
         self.key_field.setVisible(need_key or pid == "custom")
-        local = pid in ("ollama", "lmstudio")
+        self.b_pull.setVisible(pid == "ollama")
         self.lbl_llm.setText(
-            "Chạy trên máy, miễn phí: mở Ollama / LM Studio và tải sẵn model (gợi ý Qwen2.5 7B–14B cho "
-            "card 12 GB). Bấm ⟳ để lấy danh sách model." if local else
-            "Cần API key của bạn – chữ trong truyện được gửi lên máy chủ của nhà cung cấp để dịch.")
+            "Ollama: app tự mở Ollama, tự chọn model đã cài; chưa có model thì bấm ⬇ Tải model." if pid == "ollama"
+            else "LM Studio: mở LM Studio, bật Local Server, nạp model rồi bấm ⟳." if pid == "lmstudio"
+            else "Cần API key của bạn – chữ trong truyện được gửi lên máy chủ của nhà cung cấp để dịch.")
         self._cur_provider = pid
+        self._ollama_connected = False
+        self._maybe_auto_ollama()
 
     def _engine_changed(self):
         is_llm = self.cb_engine.currentData() == "llm"
         self.llm_box.setVisible(is_llm)
+        if is_llm:
+            QTimer.singleShot(0, self._maybe_auto_ollama)
         self.chk_fallback.setText("Câu AI bỏ sót → GTX dịch bù (cần mạng)" if is_llm
                                   else "Câu bỏ trống → GTX dịch bù (cần mạng)")
+
+    # ---- Ollama: tự kết nối / tải model ----
+    def _maybe_auto_ollama(self):
+        if (not getattr(self, "llm_box", None) or self.cb_engine.currentData() != "llm"
+                or self.cb_provider.currentData() != "ollama" or self._ollama_connected):
+            return
+        self._ollama_auto_connect()
+
+    def _ollama_auto_connect(self, prefer_model: str = ""):
+        if self.ollama_auto is not None and self.ollama_auto.isRunning():
+            return
+        self.lbl_llm.setText("⏳ Đang tìm Ollama trên máy...")
+        self.ollama_auto = OllamaAuto(self.ed_llm_url.text().strip() or OL.DEFAULT_URL,
+                                      prefer_model or self.cb_llm_model.currentText().strip())
+        self.ollama_auto.done.connect(self._on_ollama_auto)
+        self.ollama_auto.start()
+
+    def _on_ollama_auto(self, res):
+        if not res.get("ok"):
+            self._ollama_connected = False
+            self.lbl_llm.setText("❌ " + res.get("message", ""))
+            return
+        self._ollama_connected = True
+        models = res.get("models", [])
+        self.cb_llm_model.blockSignals(True)
+        self.cb_llm_model.clear()
+        for name, gb in models:
+            self.cb_llm_model.addItem(name)
+            self.cb_llm_model.setItemData(self.cb_llm_model.count() - 1, f"{gb} GB", Qt.ToolTipRole)
+        if res.get("model"):
+            self.cb_llm_model.setEditText(res["model"])
+        self.cb_llm_model.blockSignals(False)
+        self.lbl_llm.setText(("✅ " if models else "⚠ ") + res.get("message", ""))
+        self._store_provider_fields()
+
+    def _refresh_models(self):
+        if self.cb_provider.currentData() == "ollama":
+            self._ollama_connected = False
+            self._ollama_auto_connect()
+        else:
+            self._probe_llm(False)
+
+    def _pull_model(self, name):
+        if self.ollama_pull is not None and self.ollama_pull.isRunning():
+            QMessageBox.information(self, "Đang tải", "Đang tải một model khác, chờ xong đã.")
+            return
+        if QMessageBox.question(self, "Tải model", f"Tải model {name} về Ollama?\n"
+                                "Dung lượng vài GB, chỉ tải 1 lần.") != QMessageBox.Yes:
+            return
+        self.pull_bar.setVisible(True)
+        self.pull_bar.setRange(0, 0)
+        self.b_pull.setEnabled(False)
+        self.lbl_llm.setText(f"⏳ Đang tải {name}...")
+        self.ollama_pull = OllamaPull(self.ed_llm_url.text().strip() or OL.DEFAULT_URL, name)
+        self.ollama_pull.progress.connect(self._on_pull_progress)
+        self.ollama_pull.done.connect(lambda ok, msg, n=name: self._on_pull_done(ok, msg, n))
+        self.ollama_pull.start()
+
+    def _on_pull_progress(self, pct, txt):
+        if pct < 0:
+            self.pull_bar.setRange(0, 0)
+        else:
+            self.pull_bar.setRange(0, 1000)
+            self.pull_bar.setValue(int(pct * 10))
+            self.pull_bar.setFormat(f"{pct:.0f}%")
+        self.lbl_llm.setText(f"⏳ {txt}")
+
+    def _on_pull_done(self, ok, msg, name):
+        self.pull_bar.setVisible(False)
+        self.b_pull.setEnabled(True)
+        self.lbl_llm.setText(msg)
+        if ok:
+            self._ollama_connected = False
+            self._ollama_auto_connect(prefer_model=name)
 
     def _probe_llm(self, chat_test):
         if self.llm_probe is not None and self.llm_probe.isRunning():
@@ -1337,7 +1475,9 @@ class MainWindow(QMainWindow):
             self.worker.stop_event.set()
             if not self.worker.wait(8000):
                 os._exit(0)  # luồng đang tải model / gọi mạng -> thoát cứng cho khỏi treo
-        for th in (self.probe, self.checker, self.llm_probe):
+        if self.ollama_pull is not None and self.ollama_pull.isRunning():
+            self.ollama_pull.stop_event.set()
+        for th in (self.probe, self.checker, self.llm_probe, self.ollama_auto, self.ollama_pull):
             if th is not None and th.isRunning():
                 th.wait(3000)
         super().closeEvent(e)

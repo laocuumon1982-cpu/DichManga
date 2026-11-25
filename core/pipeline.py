@@ -241,6 +241,17 @@ class Pipeline:
             from .llm import PROVIDERS, LLMClient
 
             self.llm = LLMClient(self.cfg.llm_provider, self.cfg.llm_url, self.cfg.llm_model, self.api_key)
+            if self.cfg.llm_provider == "ollama":
+                from .ollama import auto_connect
+
+                res = auto_connect(self.llm.base, self.llm.model, self.log)
+                if not res["ok"]:
+                    raise RuntimeError(res["message"])
+                if not res["model"]:
+                    raise RuntimeError("Ollama chưa có model nào – trong app bấm ⬇ Tải model (gợi ý qwen2.5:14b)")
+                if res["model"] != self.llm.model:
+                    self.log(f"  Ollama chưa có '{self.llm.model}' → dùng {res['model']}")
+                    self.llm.model = res["model"]
             self.log(f"Bộ dịch: AI {PROVIDERS[self.cfg.llm_provider][0]} – model {self.llm.model or '?'} "
                      "(dịch cả chương theo ngữ cảnh)")
             return

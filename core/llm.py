@@ -20,7 +20,7 @@ KIND_HINT = {"thought": "suy nghĩ", "shout": "hét", "narration": "dẫn truy�
 
 # id: (tên hiển thị, URL mặc định, model mặc định, cần API key?, kiểu API)
 PROVIDERS = {
-    "ollama":   ("Ollama – chạy trên máy", "http://localhost:11434/v1", "qwen2.5:14b", False, "openai"),
+    "ollama":   ("Ollama – chạy trên máy", "http://localhost:11434/v1", "qwen2.5:14b", False, "ollama"),
     "lmstudio": ("LM Studio – chạy trên máy", "http://localhost:1234/v1", "", False, "openai"),
     "deepseek": ("DeepSeek (API key)", "https://api.deepseek.com", "deepseek-chat", True, "openai"),
     "gemini":   ("Google Gemini (API key)", "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -52,7 +52,21 @@ def friendly_error(e) -> str:
     """Lỗi dễ hiểu cho người dùng, không bao giờ để lộ API key."""
     t = str(e)
     t = re.sub(r"(key|token|Bearer)[=: ]+[A-Za-z0-9_\-\.]{8,}", r"\1=***", t, flags=re.I)
-    code = getattr(getattr(e, "response", None), "status_code", None)
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", None)
+    body = ""
+    try:
+        body = resp.text[:300] if resp is not None else ""
+    except Exception:  # noqa: BLE001
+        pass
+    if "not found" in body and ("pull" in body or "model" in body):
+        try:
+            body = str(json.loads(body).get("error", body))  # {"error": "model \"x\" not found..."}
+        except (ValueError, AttributeError):
+            pass
+        m = re.search(r'model ["\']?([^"\'\s]+)["\']?', body)
+        name = m.group(1) if m else ""
+        return f"Ollama chưa có model {name} – bấm ⬇ Tải model hoặc chọn model đã cài (⟳)"
     if isinstance(e, requests.ConnectionError):
         return "không kết nối được – kiểm tra địa chỉ URL / Ollama hoặc LM Studio đã mở chưa"
     if isinstance(e, requests.Timeout):
@@ -86,6 +100,10 @@ class LLMClient:
 
     def list_models(self):
         """Danh sách model trên máy chủ (Ollama / LM Studio / OpenAI...)."""
+        if self.api == "ollama":
+            from .ollama import installed
+
+            return [n for n, _ in installed(self.base)]
         if self.api == "anthropic":
             r = self.s.get(self.base.rstrip("/") + "/v1/models", timeout=15,
                            headers={"x-api-key": self.key, "anthropic-version": "2023-06-01"})
@@ -98,6 +116,24 @@ class LLMClient:
     def chat(self, system: str, user: str) -> str:
         if not self.model:
             raise RuntimeError("Chưa nhập tên model")
+        if self.api == "ollama":
+            # API gốc của Ollama: đặt được độ dài ngữ cảnh (mặc định Ollama chỉ ~2–4k token, chương dài
+            # sẽ bị cắt mất), giữ model trong VRAM 30 phút, tắt chế độ 'suy nghĩ' của Qwen3 cho nhanh
+            from .ollama import root_url
+
+            r = self.s.post(root_url(self.base) + "/api/chat", timeout=self.timeout,
+                            json={"model": self.model, "stream": False, "keep_alive": "30m", "think": False,
+                                  "options": {"temperature": 0.3, "num_ctx": 8192},
+                                  "messages": [{"role": "system", "content": system},
+                                               {"role": "user", "content": user}]})
+            if r.status_code == 400 and "think" in r.text:  # Ollama cũ / model không hỗ trợ 'think'
+                r = self.s.post(root_url(self.base) + "/api/chat", timeout=self.timeout,
+                                json={"model": self.model, "stream": False, "keep_alive": "30m",
+                                      "options": {"temperature": 0.3, "num_ctx": 8192},
+                                      "messages": [{"role": "system", "content": system},
+                                                   {"role": "user", "content": user}]})
+            r.raise_for_status()
+            return (r.json().get("message") or {}).get("content", "")
         if self.api == "anthropic":
             r = self.s.post(self.base.rstrip("/") + "/v1/messages", timeout=self.timeout,
                             headers={"x-api-key": self.key, "anthropic-version": "2023-06-01",
