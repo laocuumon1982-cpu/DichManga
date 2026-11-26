@@ -9,8 +9,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyProduct("Dich Truyen Tranh")]
 [assembly: System.Reflection.AssemblyCompany("Duy Anh")]
 [assembly: System.Reflection.AssemblyCopyright("Duy Anh")]
-[assembly: System.Reflection.AssemblyFileVersion("2.1.1.0")]
-[assembly: System.Reflection.AssemblyVersion("2.1.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.1.2.0")]
+[assembly: System.Reflection.AssemblyVersion("2.1.2.0")]
 
 static class Launcher
 {

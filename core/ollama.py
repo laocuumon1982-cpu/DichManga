@@ -110,12 +110,21 @@ def start_server(url: str, log=print, wait: float = 20):
     return None
 
 
-def pull(url: str, model: str, progress=None, stop_event=None):
-    """Tải model về Ollama. progress(phần trăm 0–100, mô tả)."""
-    with requests.post(root_url(url) + "/api/pull", json={"model": model, "stream": True},
-                       stream=True, timeout=(10, 600)) as r:
-        r.raise_for_status()
-        last_err = None
+def _has_model(url: str, model: str) -> bool:
+    try:
+        want = model.replace(":latest", "")
+        return any(n.replace(":latest", "") == want for n, _ in installed(url))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _pull_api(url, model, progress, stop_event):
+    """Tải qua API /api/pull (gửi cả 'model' lẫn 'name' cho Ollama bản cũ)."""
+    with requests.post(root_url(url) + "/api/pull", json={"model": model, "name": model, "stream": True},
+                       stream=True, timeout=(10, 900)) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"Ollama trả lỗi {r.status_code}: {r.text[:200]}")
+        ok = False
         for line in r.iter_lines():
             if stop_event is not None and stop_event.is_set():
                 raise RuntimeError("Đã huỷ tải model")
@@ -126,17 +135,79 @@ def pull(url: str, model: str, progress=None, stop_event=None):
             except ValueError:
                 continue
             if d.get("error"):
-                last_err = d["error"]
-                break
+                raise RuntimeError(d["error"])
             st = d.get("status", "")
+            if st == "success":
+                ok = True
             total, done = d.get("total") or 0, d.get("completed") or 0
             if progress:
                 if total:
                     progress(100.0 * done / total, f"{st}: {done / 1024 ** 3:.1f}/{total / 1024 ** 3:.1f} GB")
                 else:
                     progress(None, st)
-        if last_err:
-            raise RuntimeError(last_err)
+        if not ok:
+            raise RuntimeError("kết nối bị ngắt giữa chừng")
+
+
+_PCT = re.compile(r"(\d{1,3})%")
+_SIZE = re.compile(r"([\d.]+\s*[KMGT]?B)\s*/\s*([\d.]+\s*[KMGT]?B)")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _pull_cli(model, progress, stop_event):
+    """Dự phòng: chạy lệnh 'ollama pull <model>' (cách tải chuẩn của Ollama), đọc % từ màn hình lệnh."""
+    exe = find_exe()
+    if not exe:
+        raise RuntimeError("không tìm thấy ollama.exe")
+    flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+    proc = subprocess.Popen([exe, "pull", model], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, creationflags=flags)
+    buf, tail = b"", ""
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                proc.kill()
+                raise RuntimeError("Đã huỷ tải model")
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            if ch in (b"\r", b"\n"):
+                txt = _ANSI.sub("", buf.decode("utf-8", "replace")).strip()
+                buf = b""
+                if not txt:
+                    continue
+                tail = txt
+                if progress:
+                    m, sz = _PCT.search(txt), _SIZE.search(txt)
+                    label = txt.split(":")[0][:40] + (f": {sz.group(1)}/{sz.group(2)}" if sz else "")
+                    progress(float(m.group(1)) if m else None, label)
+            else:
+                buf += ch
+    finally:
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(tail or f"ollama pull thoát với mã {rc}")
+
+
+def pull(url: str, model: str, progress=None, stop_event=None, log=print):
+    """Tải model về Ollama. progress(phần trăm 0–100 hoặc None, mô tả).
+    Thử API trước; lỗi thì chạy lệnh 'ollama pull'. Cuối cùng kiểm tra model đã có thật chưa."""
+    errors = []
+    try:
+        _pull_api(url, model, progress, stop_event)
+    except Exception as e:  # noqa: BLE001
+        if stop_event is not None and stop_event.is_set():
+            raise
+        errors.append(f"API: {e}")
+        log(f"Tải qua API lỗi ({e}) – thử lệnh 'ollama pull'...")
+        try:
+            _pull_cli(model, progress, stop_event)
+        except Exception as e2:  # noqa: BLE001
+            if stop_event is not None and stop_event.is_set():
+                raise
+            errors.append(f"lệnh ollama pull: {e2}")
+    if not _has_model(url, model):
+        raise RuntimeError(" | ".join(errors) or "tải xong nhưng Ollama chưa thấy model – mở lại Ollama rồi bấm ⟳")
 
 
 def auto_connect(url: str, current_model: str = "", log=print):

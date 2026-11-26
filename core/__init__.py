@@ -1,6 +1,6 @@
 """Lõi xử lý của Dịch Truyện Tranh."""
 APP_NAME = "Dịch Truyện Tranh"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 APP_AUTHOR = "Duy Anh"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION} by {APP_AUTHOR}"
 GITHUB_REPO = "laocuumon1982-cpu/DichManga"

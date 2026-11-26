@@ -150,7 +150,7 @@ class OllamaPull(QThread):
             if not OL.start_server(self.url, log=lambda m: None):
                 raise RuntimeError("Không mở được Ollama – hãy cài / mở Ollama trước")
             OL.pull(self.url, self.model, lambda pct, txt: self.progress.emit(-1.0 if pct is None else pct, txt),
-                    self.stop_event)
+                    self.stop_event, log=lambda msg: self.progress.emit(-1.0, msg))
             self.done.emit(True, f"✅ Đã tải xong {self.model}")
         except Exception as e:  # noqa: BLE001
             self.done.emit(False, f"❌ Tải {self.model} lỗi: {friendly_error(e)}")
@@ -873,6 +873,11 @@ class MainWindow(QMainWindow):
         self.pull_bar.setVisible(False)
         self.b_pull.setEnabled(True)
         self.lbl_llm.setText(msg)
+        self.log(msg)
+        if not ok:
+            QMessageBox.warning(self, "Không tải được model",
+                                f"{msg}\n\nCó thể tải tay: mở Command Prompt (CMD) gõ\n    ollama pull {name}\n"
+                                "xong quay lại app bấm ⟳.")
         if ok:
             self._ollama_connected = False
             self._ollama_auto_connect(prefer_model=name)
