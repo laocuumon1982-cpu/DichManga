@@ -1,4 +1,4 @@
-## Dịch Truyện Tranh v2.1.2 by Duy Anh
+## Dịch Truyện Tranh v2.1.3 by Duy Anh
 
 Dịch truyện tranh **Trung · Nhật · Anh → Tiếng Việt**, chạy trên máy (GPU NVIDIA hoặc CPU).
 
@@ -11,6 +11,12 @@ Dịch truyện tranh **Trung · Nhật · Anh → Tiếng Việt**, chạy trê
 - **Bản GPU**: tải **tất cả** các phần `.7z.00x` vào cùng thư mục → chuột phải file **`.7z.001`** → 7-Zip → *Extract Here*.
 - Mở **`DichTruyenTranh.exe`**. Lần đầu dịch app tự tải model (cần Internet).
 - `DichTruyenTranh_app_update.zip` là gói cho nút **Cập nhật** trong app – không cần tải tay.
+
+### ⚡ v2.1.3 – AI dịch không còn "đứng" ở 45%
+- Thanh tiến độ **chạy liên tục trong lúc AI đang viết** (hiện số ký tự đã viết, tốc độ ký tự/giây), không còn đứng yên ở 45%.
+- AI chạy trên máy (Ollama / LM Studio): trước khi dịch, app **giải phóng VRAM** của model đọc chữ; model xoá chữ LaMa nạp **sau** khi AI dịch xong → model AI nạp trọn vào GPU, dịch nhanh hơn nhiều.
+- Cảnh báo khi model AI **không nạp hết vào GPU** (thiếu VRAM, phải chạy một phần bằng CPU → rất chậm), gợi ý dùng model nhỏ hơn.
+- Chia chương thành phần nhỏ hơn cho model chạy máy; bấm **Dừng** là dừng ngay cả khi AI đang viết.
 
 ### 🛠 v2.1.2 – Sửa lỗi không tải được model Ollama
 - Nút **⬇ Tải model** chạy được với cả Ollama bản cũ (gửi tên model theo cả hai kiểu API).

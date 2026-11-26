@@ -110,6 +110,18 @@ def start_server(url: str, log=print, wait: float = 20):
     return None
 
 
+def gpu_share(url: str, model: str):
+    """Tỉ lệ model đang nằm trong VRAM (0–1), None nếu model chưa nạp / không đọc được."""
+    r = requests.get(root_url(url) + "/api/ps", timeout=5)
+    r.raise_for_status()
+    want = model.replace(":latest", "")
+    for m in r.json().get("models", []):
+        if (m.get("name") or m.get("model") or "").replace(":latest", "") == want:
+            size = m.get("size") or 0
+            return (m.get("size_vram") or 0) / size if size else None
+    return None
+
+
 def _has_model(url: str, model: str) -> bool:
     try:
         want = model.replace(":latest", "")

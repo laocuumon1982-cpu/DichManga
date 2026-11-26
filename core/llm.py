@@ -113,27 +113,41 @@ class LLMClient:
         r.raise_for_status()
         return sorted(m.get("id", "") for m in r.json().get("data", []) if m.get("id"))
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, on_text=None) -> str:
+        """Gửi 1 yêu cầu. on_text(số ký tự đã nhận): có thì nhận chữ dần (streaming) để báo tiến độ."""
         if not self.model:
             raise RuntimeError("Chưa nhập tên model")
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         if self.api == "ollama":
             # API gốc của Ollama: đặt được độ dài ngữ cảnh (mặc định Ollama chỉ ~2–4k token, chương dài
             # sẽ bị cắt mất), giữ model trong VRAM 30 phút, tắt chế độ 'suy nghĩ' của Qwen3 cho nhanh
             from .ollama import root_url
 
-            r = self.s.post(root_url(self.base) + "/api/chat", timeout=self.timeout,
-                            json={"model": self.model, "stream": False, "keep_alive": "30m", "think": False,
-                                  "options": {"temperature": 0.3, "num_ctx": 8192},
-                                  "messages": [{"role": "system", "content": system},
-                                               {"role": "user", "content": user}]})
+            body = {"model": self.model, "stream": on_text is not None, "keep_alive": "30m", "think": False,
+                    "options": {"temperature": 0.3, "num_ctx": 8192}, "messages": msgs}
+            url = root_url(self.base) + "/api/chat"
+            r = self.s.post(url, timeout=(15, self.timeout), json=body, stream=on_text is not None)
             if r.status_code == 400 and "think" in r.text:  # Ollama cũ / model không hỗ trợ 'think'
-                r = self.s.post(root_url(self.base) + "/api/chat", timeout=self.timeout,
-                                json={"model": self.model, "stream": False, "keep_alive": "30m",
-                                      "options": {"temperature": 0.3, "num_ctx": 8192},
-                                      "messages": [{"role": "system", "content": system},
-                                                   {"role": "user", "content": user}]})
+                body.pop("think")
+                r = self.s.post(url, timeout=(15, self.timeout), json=body, stream=on_text is not None)
             r.raise_for_status()
-            return (r.json().get("message") or {}).get("content", "")
+            if on_text is None:
+                return (r.json().get("message") or {}).get("content", "")
+            out = []
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("error"):
+                    raise RuntimeError(d["error"])
+                out.append((d.get("message") or {}).get("content", ""))
+                on_text(sum(len(x) for x in out))
+                if d.get("done"):
+                    break
+            return "".join(out)
         if self.api == "anthropic":
             r = self.s.post(self.base.rstrip("/") + "/v1/messages", timeout=self.timeout,
                             headers={"x-api-key": self.key, "anthropic-version": "2023-06-01",
@@ -141,14 +155,36 @@ class LLMClient:
                             json={"model": self.model, "max_tokens": 8000, "temperature": 0.3,
                                   "system": system, "messages": [{"role": "user", "content": user}]})
             r.raise_for_status()
-            return "".join(p.get("text", "") for p in r.json().get("content", []))
+            txt = "".join(p.get("text", "") for p in r.json().get("content", []))
+            if on_text:
+                on_text(len(txt))
+            return txt
         h = {"Authorization": f"Bearer {self.key}"} if self.key else {}
-        r = self.s.post(_chat_url(self.base), timeout=self.timeout, headers=h,
-                        json={"model": self.model, "temperature": 0.3, "stream": False,
-                              "messages": [{"role": "system", "content": system},
-                                           {"role": "user", "content": user}]})
+        body = {"model": self.model, "temperature": 0.3, "stream": on_text is not None, "messages": msgs}
+        r = self.s.post(_chat_url(self.base), timeout=(15, self.timeout), headers=h, json=body,
+                        stream=on_text is not None)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"] or ""
+        if on_text is None:
+            return r.json()["choices"][0]["message"]["content"] or ""
+        if "text/event-stream" not in r.headers.get("content-type", ""):  # máy chủ không hỗ trợ stream
+            txt = r.json()["choices"][0]["message"]["content"] or ""
+            on_text(len(txt))
+            return txt
+        out = []
+        for line in r.iter_lines():
+            if not line or not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                break
+            try:
+                d = json.loads(data)
+            except ValueError:
+                continue
+            ch = (d.get("choices") or [{}])[0]
+            out.append((ch.get("delta") or {}).get("content") or "")
+            on_text(sum(len(x) for x in out))
+        return "".join(out)
 
 
 # ---------------------------------------------------------------------
@@ -227,36 +263,78 @@ def chunks(items, limit):
 def translate_chapter(client: LLMClient, lang, items, terms=None, style="", notes="",
                       log=print, progress=None, stop_event=None):
     """items: [{"id", "page", "text", "kind"?}] theo thứ tự đọc cả chương.
+    progress(tỉ lệ 0–1, mô tả) – cập nhật liên tục trong lúc AI đang viết.
     Trả về {id: bản dịch} (có thể thiếu id nếu AI lỗi – bên gọi tự dịch bù)."""
-    limit = 2200 if client.provider in LOCAL_PROVIDERS else 6000  # model chạy máy: ngữ cảnh ngắn hơn
+    local = client.provider in LOCAL_PROVIDERS
+    limit = 1500 if local else 6000  # model chạy máy: phần nhỏ hơn -> ngữ cảnh ngắn, tiến độ đều hơn
     parts = chunks(items, limit)
     result = {}
     by_id = {it["id"]: it for it in items}
+    n = len(parts)
+    checked_gpu = False
     for k, part in enumerate(parts):
         if stop_event is not None and stop_event.is_set():
             break
-        if progress:
-            progress(k, len(parts))
         done = [(by_id[i]["text"], v) for i, v in list(result.items())[-25:]]
         system, user = build_prompt(lang, part, terms or [], style, notes, done)
         want = {it["id"] for it in part}
         for attempt in range(2):
+            # bản dịch tiếng Việt + JSON thường dài ~3 lần chữ Hán/Nhật gốc
+            expect = max(200, int(sum(len(it["text"]) for it in part) * 3.2 + 28 * len(part)))
+            t0 = time.time()
+            first = {"t": None}
+
+            def on_text(nchar, k=k, t0=t0, expect=expect, first=first):
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Đã dừng")
+                now = time.time()
+                if first["t"] is None:
+                    first["t"] = now
+                if progress:
+                    speed = nchar / max(0.5, now - first["t"])
+                    progress((k + min(0.97, nchar / expect)) / n,
+                             f"AI đang dịch phần {k + 1}/{n} – đã viết {nchar} ký tự ({speed:.0f} ký tự/s)")
+
+            if progress:
+                progress(k / n, f"AI đang dịch phần {k + 1}/{n} – chờ AI bắt đầu trả lời"
+                         + (" (lần đầu nạp model vào GPU có thể mất 10–60 giây)" if k == 0 and local else ""))
             try:
-                t0 = time.time()
-                got = parse_reply(client.chat(system, user))
+                got = parse_reply(client.chat(system, user, on_text=on_text))
                 got = {i: v for i, v in got.items() if i in want and v}
                 result.update(got)
-                log(f"  AI dịch phần {k + 1}/{len(parts)}: {len(got)}/{len(part)} câu – {time.time() - t0:.1f}s")
+                wait = (first["t"] - t0) if first["t"] else 0
+                log(f"  AI dịch phần {k + 1}/{n}: {len(got)}/{len(part)} câu – {time.time() - t0:.1f}s"
+                    + (f" (chờ AI trả lời {wait:.0f}s)" if wait > 5 else ""))
+                if not checked_gpu and client.provider == "ollama":
+                    checked_gpu = True
+                    _warn_gpu(client, log)
                 if len(got) >= len(part) or attempt:
                     break
                 # thiếu câu -> hỏi lại riêng các câu còn thiếu
                 part = [it for it in part if it["id"] not in got]
                 system, user = build_prompt(lang, part, terms or [], style, notes, done)
             except Exception as e:  # noqa: BLE001
+                if stop_event is not None and stop_event.is_set():
+                    return result
                 log(f"  ! AI lỗi ở phần {k + 1}: {friendly_error(e)}")
                 if isinstance(e, (requests.ConnectionError,)) or getattr(
                         getattr(e, "response", None), "status_code", None) in (401, 402, 403, 404):
                     return result  # lỗi cấu hình -> không thử tiếp các phần sau
     if progress:
-        progress(len(parts), len(parts))
+        progress(1.0, "AI dịch xong")
     return result
+
+
+def _warn_gpu(client, log):
+    """Ollama: model không nạp hết vào GPU (thiếu VRAM) -> chạy một phần trên CPU, rất chậm."""
+    try:
+        from .ollama import gpu_share
+
+        share = gpu_share(client.base, client.model)
+        if share is not None and share < 0.95:
+            log(f"  ⚠ Model chỉ nạp được {share * 100:.0f}% vào GPU (thiếu VRAM) – phần còn lại chạy CPU nên "
+                "dịch CHẬM. Nên dùng model nhỏ hơn (vd. qwen2.5:7b) hoặc tắt app khác đang dùng GPU.")
+        elif share is not None:
+            log("  Model AI chạy 100% trên GPU")
+    except Exception:  # noqa: BLE001
+        pass

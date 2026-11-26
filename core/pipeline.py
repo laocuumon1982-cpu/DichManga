@@ -164,6 +164,26 @@ def get_local_translator(model_id: str, device: str, src_lang: str, log):
 _LAMA_CACHE = {}
 
 
+def free_gpu(log=print):
+    """Bỏ model đọc chữ / xoá chữ khỏi VRAM để AI chạy trên máy (Ollama...) có đủ bộ nhớ GPU."""
+    had = bool(_OCR_CACHE or _LAMA_CACHE)
+    _OCR_CACHE.clear()
+    _LAMA_CACHE.clear()
+    try:
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if had:
+                free, total = torch.cuda.mem_get_info()
+                log(f"  Đã giải phóng VRAM cho AI: còn trống {free / 1024 ** 3:.1f}/{total / 1024 ** 3:.1f} GB")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def get_lama(device: str, log, stop_event=None):
     from .inpaint import LamaInpainter
 
@@ -219,7 +239,11 @@ class Pipeline:
             self.log(f"  ({info})")
         if need_ocr:
             self.ocr = get_ocr(self.cfg.src_lang, dev == "cuda", self.log)
-        if need_clean and self.cfg.use_lama:
+        self._dev = dev
+        # AI chạy trên máy dùng chung GPU -> LaMa nạp SAU khi AI dịch xong (đỡ tranh VRAM)
+        self._lama_later = (self.cfg.engine == MODES_LLM and self.cfg.llm_provider in ("ollama", "lmstudio", "custom")
+                            and dev == "cuda")
+        if need_clean and self.cfg.use_lama and not self._lama_later:
             try:
                 self.lama = get_lama(dev, self.log, self.stop)
                 self.log(f"Xoá chữ trên hình: AI LaMa ({dev.upper()})")
@@ -481,11 +505,21 @@ class Pipeline:
             return self._finish(project, n, t_all, 0)
 
         # 2. AI dịch cả chương một lượt
+        if getattr(self, "_lama_later", False):
+            self.ocr = None
+            free_gpu(self.log)
         self.log(f"AI đang dịch cả chương ({sum(len(r[3]) for r in read)} khung chữ)...")
         prog(0.45, "AI đang dịch cả chương...")
         self.translate_chapter([(i, blocks) for i, _s, _im, blocks in read],
-                               progress=lambda k, m: prog(0.45 + 0.25 * k / max(1, m),
-                                                          f"AI đang dịch phần {min(k + 1, m)}/{m}"))
+                               progress=lambda f, t: prog(0.45 + 0.25 * f, t))
+        if getattr(self, "_lama_later", False) and self.cfg.use_lama and not self.stop.is_set():
+            prog(0.70, "Đang nạp model xoá chữ LaMa...")
+            try:
+                self.lama = get_lama(self._dev, self.log, self.stop)
+                self.log(f"Xoá chữ trên hình: AI LaMa ({self._dev.upper()})")
+            except Exception as e:  # noqa: BLE001
+                self.lama = None
+                self.log(f"! Không dùng được LaMa ({e}) – xoá chữ bằng OpenCV")
         # 3. xoá chữ + vẽ chữ song song
         lock = threading.Lock()
         state = {"done": 0, "failed": 0}
@@ -532,9 +566,10 @@ class Pipeline:
         else:
             todo = blocks_by_page
         prog(0.02, "Đang dịch lại...")
+        if self.llm is not None and self.cfg.llm_provider in ("ollama", "lmstudio", "custom"):
+            free_gpu(self.log)  # AI chạy trên máy cần VRAM
         if self.llm is not None:
-            self.translate_chapter(todo, progress=lambda k, m: prog(0.6 * k / max(1, m),
-                                                                    f"AI đang dịch phần {min(k + 1, m)}/{m}"))
+            self.translate_chapter(todo, progress=lambda f, t: prog(0.6 * f, t))
         else:
             for k, (i, bl) in enumerate(todo):
                 if self.stop.is_set():
