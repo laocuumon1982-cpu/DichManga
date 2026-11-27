@@ -1,0 +1,15 @@
+SCREENSHOT_OK D:\a\DichManga\DichManga\report\ui_windows_CPU.png
+(False, 'Không có GPU NVIDIA – chạy bằng CPU')
+
+Name                Length
+----                ------
+app                 
+models              
+python              
+Chay_xem_loi.bat    105
+config.json         762
+data.db             16384
+DichTruyenTranh.exe 61440
+HUONG_DAN.txt       687
+
+
