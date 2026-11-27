@@ -49,11 +49,12 @@ def main(langs):
             hf_model(mid)
             snapshot_download(mid, allow_patterns=["*.json", "*.spm", "*.model", "*.txt", f"{CT2_SUBFOLDER}/*"])
 
-    if "ja" in langs:
-        step("manga-ocr (OCR tiếng Nhật)")
-        from manga_ocr import MangaOcr
+    if "ja" in langs or "ko" in langs:
+        if "ja" in langs:
+            step("manga-ocr (OCR tiếng Nhật)")
+            from manga_ocr import MangaOcr
 
-        MangaOcr(force_cpu=True)
+            MangaOcr(force_cpu=True)
         mid = "facebook/nllb-200-distilled-600M"
         step(f"Model dịch {mid} (~2.4 GB)")
         hf_model(mid)
@@ -67,4 +68,4 @@ def main(langs):
 
 if __name__ == "__main__":
     args = [a.lower() for a in sys.argv[1:]] or ["zh", "ja", "en"]
-    main([a for a in args if a in ("zh", "zh_tw", "ja", "en")])
+    main([a for a in args if a in ("zh", "zh_tw", "ja", "ko", "en")])

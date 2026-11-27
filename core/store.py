@@ -212,3 +212,110 @@ class Glossary:
                     re.sub(rf"\b{re.escape(r['src'])}\b", r["dst"], t)
             out.append(" ".join(t.split()))
         return out
+
+
+# =====================================================================
+#  data.db – xưng hô giữa các nhân vật (cho AI dịch đúng vai vế)
+# =====================================================================
+PRONOUN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pronouns (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    a         TEXT NOT NULL,             -- nhân vật A (tên gốc hoặc tên Việt)
+    b         TEXT NOT NULL,             -- nhân vật B
+    a_self    TEXT NOT NULL DEFAULT '',  -- A tự xưng
+    a_calls_b TEXT NOT NULL DEFAULT '',  -- A gọi B là
+    b_self    TEXT NOT NULL DEFAULT '',  -- B tự xưng
+    b_calls_a TEXT NOT NULL DEFAULT '',  -- B gọi A là
+    note      TEXT NOT NULL DEFAULT '',
+    enabled   INTEGER NOT NULL DEFAULT 1,
+    updated   TEXT NOT NULL DEFAULT '',
+    UNIQUE(a, b)
+);
+"""
+# mẫu xưng hô hay gặp: (tên mẫu, A xưng, A gọi B, B xưng, B gọi A)
+PRONOUN_PRESETS = [
+    ("Anh – Em", "anh", "em", "em", "anh"),
+    ("Chị – Em", "chị", "em", "em", "chị"),
+    ("Tớ – Cậu (bạn bè)", "tớ", "cậu", "tớ", "cậu"),
+    ("Tao – Mày (thân / gây gổ)", "tao", "mày", "tao", "mày"),
+    ("Tôi – Anh (lịch sự)", "tôi", "anh", "tôi", "anh"),
+    ("Ta – Ngươi (cổ trang)", "ta", "ngươi", "ta", "ngươi"),
+    ("Huynh – Muội", "huynh", "muội", "muội", "huynh"),
+    ("Sư phụ – Đồ nhi", "vi sư", "đồ nhi", "đồ nhi", "sư phụ"),
+    ("Bố – Con", "bố", "con", "con", "bố"),
+    ("Mẹ – Con", "mẹ", "con", "con", "mẹ"),
+    ("Bổn vương – Thần", "bổn vương", "ngươi", "thần", "điện hạ"),
+    ("Thầy/Cô – Em (học đường)", "thầy", "em", "em", "thầy"),
+]
+
+
+class Pronouns:
+    """Bảng xưng hô A ↔ B dùng chung cho mọi truyện (bật/tắt từng cặp)."""
+
+    def __init__(self, path: Path = DB_PATH):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._conn() as c:
+            c.executescript(PRONOUN_SCHEMA)
+
+    def _conn(self):
+        c = sqlite3.connect(self.path, timeout=10)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def all(self):
+        with self._conn() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM pronouns ORDER BY a COLLATE NOCASE, b")]
+
+    def upsert(self, a, b, a_self="", a_calls_b="", b_self="", b_calls_a="", note="", enabled=True, row_id=None):
+        a, b = (a or "").strip(), (b or "").strip()
+        if not a or not b:
+            return
+        vals = [(v or "").strip() for v in (a_self, a_calls_b, b_self, b_calls_a, note)]
+        now = time.strftime("%Y-%m-%d %H:%M")
+        with self.lock, self._conn() as c:
+            if row_id:
+                c.execute("UPDATE pronouns SET a=?, b=?, a_self=?, a_calls_b=?, b_self=?, b_calls_a=?, note=?, "
+                          "enabled=?, updated=? WHERE id=?", (a, b, *vals, int(bool(enabled)), now, row_id))
+            else:
+                c.execute("INSERT INTO pronouns(a, b, a_self, a_calls_b, b_self, b_calls_a, note, enabled, updated) "
+                          "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(a, b) DO UPDATE SET a_self=excluded.a_self, "
+                          "a_calls_b=excluded.a_calls_b, b_self=excluded.b_self, b_calls_a=excluded.b_calls_a, "
+                          "note=excluded.note, enabled=excluded.enabled, updated=excluded.updated",
+                          (a, b, *vals, int(bool(enabled)), now))
+
+    def delete(self, row_id):
+        with self.lock, self._conn() as c:
+            c.execute("DELETE FROM pronouns WHERE id=?", (row_id,))
+
+    @staticmethod
+    def describe(r) -> str:
+        """1 dòng mô tả cho AI: 'A ↔ B: A xưng "ta", gọi B là "ngươi"; B xưng ..., gọi A là ...'."""
+        a, b = r["a"], r["b"]
+        parts = []
+        sa = ", ".join(x for x in ((f'xưng "{r["a_self"]}"' if r.get("a_self") else ""),
+                                   (f'gọi {b} là "{r["a_calls_b"]}"' if r.get("a_calls_b") else "")) if x)
+        sb = ", ".join(x for x in ((f'xưng "{r["b_self"]}"' if r.get("b_self") else ""),
+                                   (f'gọi {a} là "{r["b_calls_a"]}"' if r.get("b_calls_a") else "")) if x)
+        if sa:
+            parts.append(f"{a} {sa}")
+        if sb:
+            parts.append(f"{b} {sb}")
+        line = f"- {a} ↔ {b}: " + "; ".join(parts) if parts else f"- {a} ↔ {b}"
+        return line + (f" ({r['note']})" if r.get("note") else "")
+
+    def prompt_text(self, texts=None) -> str:
+        """Khối XƯNG HÔ cho AI. texts: chỉ lấy cặp có tên xuất hiện (nếu tên viết bằng chữ gốc);
+        cặp ghi bằng tên Việt luôn được gửi."""
+        joined = "\n".join(texts or [])
+        lines = []
+        for r in self.all():
+            if not r["enabled"]:
+                continue
+            if texts is not None:
+                names_src = [n for n in (r["a"], r["b"]) if CJK_KANA_HANGUL.search(n)]
+                if names_src and not all(n in joined for n in names_src):
+                    continue
+            lines.append(self.describe(r))
+        return "\n".join(lines)

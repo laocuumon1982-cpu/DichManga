@@ -15,7 +15,7 @@ class GTXTranslator:
     sang đường dự phòng translate_a/t (client=dict-chrome-ex) dịch nhiều câu một lần."""
     URL = "https://translate.googleapis.com/translate_a/single"
     URL_DICT = "https://clients5.google.com/translate_a/t"
-    CODES = {"zh": "zh-CN", "zh_tw": "zh-TW", "ja": "ja", "en": "en"}
+    CODES = {"zh": "zh-CN", "zh_tw": "zh-TW", "ja": "ja", "ko": "ko", "en": "en"}
     CHUNK = 1000        # số ký tự tối đa gộp trong 1 lần gọi
     GET_LIMIT = 6000    # URL dài hơn mức này thì dùng POST
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -147,7 +147,7 @@ class GTXTranslator:
 # =====================================================================
 #  Model dịch chạy local
 # =====================================================================
-NLLB_CODES = {"zh": "zho_Hans", "zh_tw": "zho_Hant", "ja": "jpn_Jpan"}
+NLLB_CODES = {"zh": "zho_Hans", "zh_tw": "zho_Hant", "ja": "jpn_Jpan", "ko": "kor_Hang"}
 # Bản CTranslate2 INT8 dựng sẵn (chạy CPU nhanh gấp nhiều lần PyTorch)
 CT2_REPOS = {
     "facebook/nllb-200-distilled-600M": ("JustFrederik/nllb-200-distilled-600M-ct2-int8", ""),

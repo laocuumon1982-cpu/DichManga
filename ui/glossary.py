@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QFileDialo
 
 from core.store import Glossary
 
-LANG_OPTS = [("Mọi ngôn ngữ", ""), ("Trung", "zh"), ("Trung phồn thể", "zh_tw"), ("Nhật", "ja"), ("Anh", "en")]
+LANG_OPTS = [("Mọi ngôn ngữ", ""), ("Trung", "zh"), ("Trung phồn thể", "zh_tw"), ("Nhật", "ja"), ("Hàn", "ko"), ("Anh", "en")]
 
 
 class GlossaryDialog(QDialog):

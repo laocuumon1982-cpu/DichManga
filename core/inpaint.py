@@ -51,15 +51,27 @@ def download_model(log=print, stop_event=None) -> Path:
 
     LAMA_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = LAMA_PATH.with_suffix(".part")
-    log("Đang tải model xoá chữ LaMa (~200 MB, chỉ tải 1 lần)...")
-    with requests.get(LAMA_URL, stream=True, timeout=60) as r:
+    have = tmp.stat().st_size if tmp.exists() else 0
+    if have == LAMA_SIZE and _sha256(tmp) == LAMA_SHA256:  # lần trước tải đủ nhưng chưa kịp đổi tên
+        tmp.replace(LAMA_PATH)
+        model_ready()
+        return LAMA_PATH
+    if have >= LAMA_SIZE:
+        have = 0
+        tmp.unlink(missing_ok=True)
+    log("Đang tải model xoá chữ LaMa (~200 MB, chỉ tải 1 lần)..."
+        + (f" – tải tiếp từ {have / 1024 ** 2:.0f} MB" if have else ""))
+    headers = {"Range": f"bytes={have}-"} if have else {}
+    with requests.get(LAMA_URL, stream=True, timeout=60, headers=headers) as r:
         r.raise_for_status()
-        total = int(r.headers.get("content-length") or LAMA_SIZE)
-        done, last = 0, -1
-        with open(tmp, "wb") as f:
+        if have and r.status_code != 206:  # máy chủ không hỗ trợ tải tiếp -> tải lại từ đầu
+            have = 0
+        total = have + int(r.headers.get("content-length") or (LAMA_SIZE - have))
+        done, last = have, -1
+        with open(tmp, "ab" if have else "wb") as f:
             for chunk in r.iter_content(1 << 20):
                 if stop_event is not None and stop_event.is_set():
-                    raise RuntimeError("Đã dừng khi đang tải model")
+                    raise RuntimeError("Đã dừng khi đang tải model (lần sau sẽ tải tiếp)")
                 f.write(chunk)
                 done += len(chunk)
                 pct = int(100 * done / max(1, total))

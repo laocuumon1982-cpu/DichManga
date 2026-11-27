@@ -13,13 +13,15 @@ import numpy as np
 
 from .block import TextBlock
 
-CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ]")
-EASYOCR_LANGS = {"zh": ["ch_sim", "en"], "zh_tw": ["ch_tra", "en"], "ja": ["ja", "en"], "en": ["en"]}
+CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ가-힯ᄀ-ᇿ]")
+EASYOCR_LANGS = {"zh": ["ch_sim", "en"], "zh_tw": ["ch_tra", "en"], "ja": ["ja", "en"], "ko": ["ko", "en"],
+                 "en": ["en"]}
+SPACED = ("en", "ko")  # ngôn ngữ có dấu cách giữa các từ, chữ luôn viết ngang
 LATIN_RE = re.compile(r"[A-Za-z].*[A-Za-z]")
 
 
 def is_valid_text(t: str, lang: str) -> bool:
-    """Bỏ nhiễu: tiếng Anh cần ≥ 2 chữ cái, tiếng Trung/Nhật cần ≥ 1 chữ CJK."""
+    """Bỏ nhiễu: tiếng Anh cần ≥ 2 chữ cái, tiếng Trung/Nhật/Hàn cần ≥ 1 chữ CJK / Hangul."""
     if lang == "en":
         return bool(LATIN_RE.search(t))
     return bool(CJK_RE.search(t))
@@ -128,6 +130,8 @@ def group_rects(rects):
 def clean_text(t: str, lang: str = "zh") -> str:
     if lang == "en":
         return fix_english(t or "")
+    if lang == "ko":
+        return " ".join((t or "").split())
     t = (t or "").replace("\n", "").strip()
     # bỏ khoảng trắng chen giữa các ký tự CJK
     t = re.sub(r"(?<=[　-鿿＀-￯])\s+(?=[　-鿿＀-￯])", "", t)
@@ -188,6 +192,7 @@ class OCREngine:
         import easyocr
 
         self.lang = lang
+        self.reading = "auto"  # auto (Nhật: phải → trái, còn lại trái → phải) | rtl | ltr
         self.log = log
         self.use_gpu = use_gpu
         log(f"Đang tải EasyOCR ({', '.join(EASYOCR_LANGS[lang])}) trên {'GPU' if use_gpu else 'CPU'}...")
@@ -214,7 +219,7 @@ class OCREngine:
             link_threshold=0.4,
             canvas_size=int(min(MAX_CANVAS if self.use_gpu else 1600, max(h, w))),
             mag_ratio=1.0,
-            width_ths=0.7 if self.lang == "en" else 0.3,
+            width_ths=0.7 if self.lang == "en" else 0.5 if self.lang == "ko" else 0.3,
             height_ths=0.5,
             add_margin=0.05,
         )
@@ -284,7 +289,7 @@ class OCREngine:
             cy = (box[0][1] + box[2][1]) / 2
             for y0, y1, i in starts:
                 if y0 - 2 <= cy <= y1 + 2:
-                    texts[i] += (" " + text) if (self.lang == "en" and texts[i]) else text
+                    texts[i] += (" " + text) if (self.lang in SPACED and texts[i]) else text
                     break
         return texts
 
@@ -334,7 +339,7 @@ class OCREngine:
         rects = self.detect(img_bgr)
         if not rects:
             return []
-        vert = False if self.lang == "en" else None  # chữ Anh luôn ngang
+        vert = False if self.lang in SPACED else None  # chữ Anh / Hàn luôn ngang
         blocks = [TextBlock.from_lines([rects[i] for i in g], vertical=vert) for g in group_rects(rects)]
         try:
             if self.mocr is not None:
@@ -348,7 +353,7 @@ class OCREngine:
                         items.append((r, b.vertical))
                         owner.append(bi)
                 for bi, t in zip(owner, self.recognize_lines_zh(gray, items)):
-                    if self.lang == "en" and blocks[bi].text:
+                    if self.lang in SPACED and blocks[bi].text:
                         blocks[bi].text += " " + t
                     else:
                         blocks[bi].text += t
@@ -362,6 +367,6 @@ class OCREngine:
                 out.append(b)
         # thứ tự đọc: chia trang thành các dải ngang; manga Nhật đọc phải → trái
         band = max(1, min(H // 10, int(1.5 * W) // 6))
-        rtl = self.lang == "ja"
+        rtl = self.reading == "rtl" or (self.reading == "auto" and self.lang == "ja")
         out.sort(key=lambda b: (b.y0 // band, -b.x1 if rtl else b.x0))
         return out

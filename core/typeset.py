@@ -417,7 +417,7 @@ def _fallback_layout(text, font_path, L, R, cx, cy, size):
 
 
 def render_page(cleaned_bgr, blocks, font_path, uppercase=False, src_bgr=None, font_scale=0.7,
-                text_only=False):
+                text_only=False, restore_src=True):
     """Vẽ bản dịch lên ảnh đã xoá chữ. Cỡ chữ gần bằng chữ gốc và tự thu nhỏ cho vừa
     đúng hình bóng thoại. Khung nào chưa có bản dịch / giữ nguyên thì dán lại chữ gốc.
     text_only=True: trả về lớp chữ RGBA nền trong suốt (cho file PSD nhiều lớp)."""
@@ -425,7 +425,7 @@ def render_page(cleaned_bgr, blocks, font_path, uppercase=False, src_bgr=None, f
         font_path = find_default_font()
     base = cleaned_bgr.copy()
     H, W = base.shape[:2]
-    if src_bgr is not None and src_bgr.shape[:2] == (H, W) and not text_only:
+    if src_bgr is not None and src_bgr.shape[:2] == (H, W) and not text_only and restore_src:
         for b in blocks:
             if b.keep or not (b.translation or "").strip():
                 m = max(4, b.char_size() // 2)

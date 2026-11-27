@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .block import TextBlock
 from .exporter import write_text_export  # noqa: F401  (main.py dùng)
-from .loader import imread, imwrite, list_images, pdf_to_images
+from .loader import ARCHIVE_EXT, extract_archive, imread, imwrite, list_images, pdf_to_images
 from .typeset import clean_page, render_page
 
 MODES_LLM = "llm"
@@ -25,7 +25,9 @@ MODES_LLM = "llm"
 
 @dataclass
 class Config:
-    src_lang: str = "zh"          # zh | zh_tw | ja | en
+    src_lang: str = "zh"          # zh | zh_tw | ja | ko | en
+    reading: str = "auto"         # thứ tự đọc ô thoại: auto (Nhật phải→trái) | rtl | ltr
+    run_mode: str = "translate"   # translate = dịch + lồng chữ | clean = chỉ xoá chữ (bản RAW sạch)
     device: str = "auto"          # auto (ưu tiên GPU) | cuda | cpu
     engine: str = "local:ngocdang83/HachimiMT-60-zh-vi"  # "gtx" | "llm" | "local:<model Hugging Face>"
     gtx_fallback: bool = True     # câu model local / AI bỏ trống -> nhờ GTX dịch bù (nếu có mạng)
@@ -44,6 +46,14 @@ class Config:
     pdf_dpi: int = 200
     img_format: str = "jpg"       # jpg | png
     export_pdf: bool = True
+    export_cbz: bool = False      # đóng gói .cbz
+    export_script: bool = True    # kịch bản .tsv + _kich_ban.txt (nhập lại được)
+    logo_path: str = ""           # đóng dấu logo / credit nhóm dịch (PNG trong suốt)
+    logo_pos: str = "auto"
+    logo_size: int = 12           # % chiều ngang trang
+    logo_opacity: int = 85
+    logo_pages: str = "all"       # all | first | last | first_last
+    credit: str = ""              # tên nhóm dịch (ghi vào .cbz)
     out_dir: str = ""
 
     @classmethod
@@ -109,14 +119,39 @@ def load_project(path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def rerender_page(page: dict, font_path: str, uppercase: bool, font_scale: int = 70) -> None:
-    """Vẽ lại 1 trang từ ảnh đã xoá chữ + bản dịch (sau khi sửa / đổi font)."""
+def _getter(cfg):
+    if cfg is None:
+        return lambda k, d=None: d
+    if isinstance(cfg, dict):
+        return cfg.get
+    return lambda k, d=None: getattr(cfg, k, d)
+
+
+def finish_image(img, blocks, cfg, index: int, total: int):
+    """Đóng dấu logo nhóm dịch (nếu bật cho trang này)."""
+    from .postfx import logo_wanted, stamp_logo
+
+    g = _getter(cfg)
+    if not logo_wanted(g, index, total):
+        return img
+    boxes = [(b.x0, b.y0, b.x1, b.y1) for b in blocks]
+    return stamp_logo(img, g("logo_path"), g("logo_pos", "auto"), int(g("logo_size", 12) or 12),
+                      int(g("logo_opacity", 85) or 85), boxes)
+
+
+def rerender_page(page: dict, font_path: str, uppercase: bool, font_scale: int = 70, cfg=None,
+                  total: int = 0) -> None:
+    """Vẽ lại 1 trang từ ảnh đã xoá chữ + bản dịch (sau khi sửa / đổi font / nhập kịch bản).
+    cfg: cấu hình dự án (logo, chế độ chỉ xoá chữ)."""
     clean = imread(page["clean"])
     if clean is None:
         raise RuntimeError(f"Thiếu ảnh đã xoá chữ: {page['clean']}")
     src = imread(page["src"]) if page.get("src") else None
     blocks = [TextBlock.from_dict(d) for d in page["blocks"]]
-    imwrite(page["out"], render_page(clean, blocks, font_path, uppercase, src, font_scale / 100))
+    restore = _getter(cfg)("run_mode", "translate") != "clean"  # bản RAW sạch: ô trống vẫn để trống
+    img = render_page(clean, blocks, font_path, uppercase, src, font_scale / 100, restore_src=restore)
+    img = finish_image(img, blocks, cfg, page["index"], total or page["index"] + 1)
+    imwrite(page["out"], img)
     page["blocks"] = [b.to_dict() for b in blocks]  # cập nhật loại bóng / cờ tràn chữ
 
 
@@ -144,6 +179,7 @@ def get_ocr(lang: str, use_gpu: bool, log):
     else:
         _OCR_CACHE[key].log = log
     return _OCR_CACHE[key]
+
 
 
 _TR_CACHE = {}
@@ -196,7 +232,8 @@ def get_lama(device: str, log, stop_event=None):
 def default_engine(src_lang: str) -> str:
     if src_lang == "en":
         return "gtx"
-    return "local:facebook/nllb-200-distilled-600M" if src_lang == "ja" else "local:ngocdang83/HachimiMT-60-zh-vi"
+    return ("local:facebook/nllb-200-distilled-600M" if src_lang in ("ja", "ko")
+            else "local:ngocdang83/HachimiMT-60-zh-vi")
 
 
 class Pipeline:
@@ -222,6 +259,9 @@ class Pipeline:
         if source_type == "pdf":
             self.log(f"Tách trang từ PDF: {Path(source_path).name} (DPI {self.cfg.pdf_dpi})")
             pages = pdf_to_images(source_path, self.work / "src", self.cfg.pdf_dpi, self.log, self.stop)
+        elif source_type == "archive" or Path(source_path).suffix.lower() in ARCHIVE_EXT:
+            self.log(f"Giải nén truyện: {Path(source_path).name}")
+            pages = extract_archive(source_path, self.work / "src", self.log, self.stop)
         else:
             pages = list_images(source_path)
         if not pages:
@@ -239,6 +279,7 @@ class Pipeline:
             self.log(f"  ({info})")
         if need_ocr:
             self.ocr = get_ocr(self.cfg.src_lang, dev == "cuda", self.log)
+            self.ocr.reading = self.cfg.reading or "auto"
         self._dev = dev
         # AI chạy trên máy dùng chung GPU -> LaMa nạp SAU khi AI dịch xong (đỡ tranh VRAM)
         self._lama_later = (self.cfg.engine == MODES_LLM and self.cfg.llm_provider in ("ollama", "lmstudio", "custom")
@@ -260,6 +301,9 @@ class Pipeline:
         self.gtx = GTXTranslator(self.log)
         self.local = None
         self.llm = None
+        if self.cfg.run_mode == "clean":
+            self.log("Chế độ: CHỈ XOÁ CHỮ – xuất bản RAW sạch (không dịch). Có thể nhập kịch bản để lồng chữ sau.")
+            return
         engine = self.cfg.engine or default_engine(self.cfg.src_lang)
         if engine == MODES_LLM:
             from .llm import PROVIDERS, LLMClient
@@ -283,8 +327,10 @@ class Pipeline:
             engine = "gtx"  # tiếng Anh dịch bằng GTX
         if engine.startswith("local:"):
             model_id = engine.split(":", 1)[1]
-            if self.cfg.src_lang == "ja" and "zh-vi" in model_id.lower():
-                self.log("HachimiMT chỉ dịch tiếng Trung → dùng NLLB-200 cho tiếng Nhật.")
+            if self.cfg.src_lang in ("ja", "ko") and "zh-vi" in model_id.lower():
+                self.log("HachimiMT chỉ dịch tiếng Trung → dùng NLLB-200.")
+                model_id = "facebook/nllb-200-distilled-600M"
+            if self.cfg.src_lang == "ko" and "ja-vi" in model_id.lower():
                 model_id = "facebook/nllb-200-distilled-600M"
             try:
                 self.local = get_local_translator(model_id, dev, self.cfg.src_lang, self.log)
@@ -304,6 +350,8 @@ class Pipeline:
         """Dịch 1 trang (bộ dịch máy). Câu rỗng giữ rỗng."""
         if not texts:
             return []
+        if self.cfg.run_mode == "clean":
+            return [""] * len(texts)
         if self.local is None:
             src = self.glossary.apply_pre(texts, self.cfg.src_lang) if self.glossary is not None else texts
             return self._post(self.gtx.translate(src, self.cfg.src_lang))
@@ -334,8 +382,19 @@ class Pipeline:
             if self.glossary is not None else []
         if terms:
             self.log(f"  Dùng {len(terms)} thuật ngữ từ bảng thuật ngữ")
+        notes = self.cfg.llm_notes
+        if self.cfg.use_glossary:
+            try:
+                from .store import Pronouns
+
+                pr = Pronouns().prompt_text([it["text"] for it in items])
+                if pr:
+                    self.log(f"  Dùng {pr.count(chr(10)) + 1} cặp xưng hô nhân vật")
+                    notes = (notes + "\n" if notes else "") + "CÁCH XƯNG HÔ GIỮA CÁC NHÂN VẬT (bắt buộc theo):\n" + pr
+            except Exception as e:  # noqa: BLE001
+                self.log(f"  ! Không đọc được bảng xưng hô: {e}")
         got = translate_chapter(self.llm, self.cfg.src_lang, items, terms, self.cfg.llm_style,
-                                self.cfg.llm_notes, self.log, progress, self.stop)
+                                notes, self.log, progress, self.stop)
         miss = [k for k, it in enumerate(items) if not got.get(it["id"])]
         if miss and self.cfg.gtx_fallback and not self.stop.is_set():
             self.log(f"  {len(miss)} câu AI chưa dịch được → GTX dịch bù")
@@ -356,8 +415,10 @@ class Pipeline:
         clean_path = self.work / "clean" / f"{i + 1:04d}.png"
         imwrite(clean_path, clean)
         out_path = self.out / f"{i + 1:04d}.{ext}"
-        imwrite(out_path, render_page(clean, blocks, self.cfg.font_path, self.cfg.uppercase, img,
-                                      self.cfg.font_scale / 100))
+        # chế độ chỉ xoá chữ: mọi ô trống -> ra đúng ảnh sạch (vẫn tính loại bóng để lồng chữ sau)
+        res = render_page(clean, blocks, self.cfg.font_path, self.cfg.uppercase, img, self.cfg.font_scale / 100,
+                          restore_src=self.cfg.run_mode != "clean")
+        imwrite(out_path, finish_image(res, blocks, self.cfg, i, getattr(self, "_n_pages", i + 1)))
         return {"index": i, "src": str(src), "clean": str(clean_path), "out": str(out_path),
                 "blocks": [b.to_dict() for b in blocks]}
 
@@ -367,6 +428,7 @@ class Pipeline:
 
     def run(self, pages, progress=None, page_done=None) -> bool:
         """progress(xong, tổng, mô tả). Chế độ AI: đọc chữ cả chương -> dịch 1 lượt -> vẽ."""
+        self._n_pages = len(pages)
         if self.llm is not None:
             return self._run_chapter(pages, progress, page_done)
         return self._run_stream(pages, progress, page_done)
@@ -583,7 +645,8 @@ class Pipeline:
                 break
             p["blocks"] = [b.to_dict() for b in bl]
             rerender_page(p, self.cfg.font_path or cfg.get("font_path", ""), self.cfg.uppercase,
-                          self.cfg.font_scale)
+                          self.cfg.font_scale, {**cfg, **asdict(self.cfg), "run_mode": cfg.get("run_mode", "translate")},
+                          len(pages))
             if page_done:
                 page_done(p["index"], p)
             prog(0.6 + 0.4 * (k + 1) / len(pages), f"Vẽ lại trang {k + 1}/{len(pages)}")

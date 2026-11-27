@@ -1,6 +1,7 @@
-"""Dịch Truyện Tranh v2.0 by Duy Anh – dịch truyện tranh Trung / Nhật / Anh sang tiếng Việt.
+"""Dịch Truyện Tranh v2.2 by Duy Anh – dịch truyện tranh Trung / Nhật / Hàn / Anh sang tiếng Việt.
 
-Nguồn: thư mục ảnh (đánh số trang) hoặc file PDF (kéo thả vào cửa sổ cũng được).
+Nguồn: thư mục ảnh (đánh số trang), file PDF, truyện nén CBZ/ZIP, hoặc cả hàng đợi nhiều chương
+(kéo thả vào cửa sổ cũng được).
 Dịch: model chạy trên máy (HachimiMT cho tiếng Trung, NLLB-200 cho tiếng Nhật) trên GPU,
 AI (LLM: Ollama / LM Studio / DeepSeek / Gemini / OpenAI / Claude) dịch cả chương theo ngữ cảnh,
 hoặc GTX Google Translate (miễn phí, online). OCR + xoá chữ (LaMa) chạy trên GPU NVIDIA nếu máy có.
@@ -22,7 +23,8 @@ from core.paths import ICON_PATH, IS_PORTABLE, setup_env  # noqa: E402
 setup_env()  # phải chạy trước khi import PySide6 / torch
 
 from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal  # noqa: E402
-from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QPixmap  # noqa: E402
+from PySide6.QtGui import (QColor, QDesktopServices, QFontDatabase, QIcon, QKeySequence, QPixmap,  # noqa: E402
+                           QShortcut)
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QMenu,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
@@ -30,7 +32,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
-from core.loader import IMG_EXT, export_pdf, list_images, pdf_page_count  # noqa: E402
+from core.loader import ARCHIVE_EXT, IMG_EXT, archive_images, export_pdf, list_images, pdf_page_count  # noqa: E402,F401
 from core.pipeline import (Config, Pipeline, default_engine, gpu_info, load_project,  # noqa: E402
                            rerender_page, save_project, write_text_export)
 from core.fonts import list_fonts, vi_missing  # noqa: E402
@@ -40,11 +42,13 @@ from core.store import JsonSettings  # noqa: E402
 from core.typeset import KIND_VI, find_default_font  # noqa: E402
 from ui.dialogs import AboutDialog, UpdateChecker, UpdateDialog  # noqa: E402
 from ui.glossary import GlossaryDialog  # noqa: E402
+from ui.tools import (STYLE_PRESETS, FindReplaceDialog, LogoDialog, PronounDialog,  # noqa: E402
+                      ShortcutsDialog, WebtoonDialog)
 from ui.theme import QSS  # noqa: E402
 from ui.widgets import Card, CompareView, field, thumb_size  # noqa: E402
 
 LANGS = [("🇨🇳  Tiếng Trung (giản thể)", "zh"), ("🇹🇼  Tiếng Trung (phồn thể)", "zh_tw"),
-         ("🇯🇵  Tiếng Nhật", "ja"), ("🇬🇧  Tiếng Anh", "en")]
+         ("🇯🇵  Tiếng Nhật", "ja"), ("🇰🇷  Tiếng Hàn (manhwa)", "ko"), ("🇬🇧  Tiếng Anh", "en")]
 ENGINES = {
     "zh": [
         ("HachimiMT-60 – chạy trên máy, khuyên dùng", "local:ngocdang83/HachimiMT-60-zh-vi"),
@@ -58,6 +62,10 @@ ENGINES = {
         ("Opus-MT ja→vi – rất nhanh, kém chính xác", "local:Helsinki-NLP/opus-mt-ja-vi"),
         ("GTX Google – online, miễn phí", "gtx"),
     ],
+    "ko": [
+        ("NLLB-200 600M (Meta) – chạy trên máy, khuyên dùng", "local:facebook/nllb-200-distilled-600M"),
+        ("GTX Google – online, miễn phí", "gtx"),
+    ],
 }
 ENGINES["zh_tw"] = ENGINES["zh"]
 ENGINES["en"] = [("GTX Google – online, miễn phí", "gtx")]
@@ -66,6 +74,10 @@ for _k in ENGINES:
     ENGINES[_k] = ENGINES[_k] + [LLM_ITEM]
 TAB_VIEW, TAB_STATUS, TAB_LOG = 0, 1, 2
 DEVICES = [("⚡ Tự động – ưu tiên GPU", "auto"), ("Chỉ GPU (CUDA)", "cuda"), ("Chỉ CPU", "cpu")]
+RUN_MODES = [("🌐 Dịch + lồng chữ", "translate"), ("🧽 Chỉ xoá chữ (RAW sạch)", "clean")]
+READINGS = [("Tự động (Nhật: phải → trái)", "auto"), ("Phải → trái (manga)", "rtl"),
+            ("Trái → phải (manhwa, comic)", "ltr")]
+SRC_FILTER = "Truyện (*.pdf *.cbz *.zip);;PDF (*.pdf);;Truyện nén (*.cbz *.zip)"
 
 
 # =====================================================================
@@ -78,11 +90,13 @@ class Worker(QThread):
     page_done = Signal(int, object)
     finished_ok = Signal(bool, str)
     stage = Signal(str)
+    chapter = Signal(int, int, str)   # chương thứ k / tổng, tên (hàng đợi nhiều chương)
 
     def __init__(self, cfg: Config, source_type: str = "", source_path: str = "", api_key: str = "",
-                 project=None, project_path: str = ""):
+                 project=None, project_path: str = "", jobs=None):
         super().__init__()
         self.cfg, self.source_type, self.source_path = cfg, source_type, source_path
+        self.jobs = jobs or [(source_type, source_path, cfg.out_dir)]
         self.api_key = api_key
         self.project, self.project_path = project, project_path  # có project -> chế độ Dịch lại
         self.stop_event = threading.Event()
@@ -95,6 +109,8 @@ class Worker(QThread):
         try:
             pipe = Pipeline(self.cfg, log=self.log.emit, stop_event=self.stop_event, api_key=self.api_key)
             if self.project is not None:  # dịch lại dự án đã có – không đọc chữ / xoá chữ lại
+                self.cfg.run_mode = "translate"
+                pipe = Pipeline(self.cfg, log=self.log.emit, stop_event=self.stop_event, api_key=self.api_key)
                 pipe.project_path = self.project_path
                 pipe.source_name = self.project.get("source", "truyen")
                 self.stage.emit("Đang tải bộ dịch...")
@@ -103,18 +119,30 @@ class Worker(QThread):
                 ok = pipe.retranslate(self.project, progress=self._prog, page_done=self.page_done.emit)
                 self.finished_ok.emit(ok, project_path)
                 return
-            project_path = pipe.project_path
-            self.stage.emit("Đang chuẩn bị trang...")
-            pages = pipe.prepare_pages(self.source_type, self.source_path)
-            self.pages_ready.emit(pages)
-            if self.stop_event.is_set():
-                self.finished_ok.emit(False, project_path)
-                return
-            self.stage.emit("Đang tải model (lần đầu có thể mất vài phút)...")
-            pipe.load_models()
-            self.stage.emit("Đang dịch...")
-            ok = pipe.run(pages, progress=self._prog, page_done=self.page_done.emit)
-            self.finished_ok.emit(ok, project_path)
+            ok_all = True
+            n = len(self.jobs)
+            for k, (kind, path, out_dir) in enumerate(self.jobs):
+                if self.stop_event.is_set():
+                    ok_all = False
+                    break
+                cfg = Config.from_dict({**self.cfg.__dict__, "out_dir": out_dir})
+                pipe = Pipeline(cfg, log=self.log.emit, stop_event=self.stop_event, api_key=self.api_key)
+                project_path = pipe.project_path
+                if n > 1:
+                    self.chapter.emit(k + 1, n, Path(path).name)
+                    self.log.emit(f"\n========== Chương {k + 1}/{n}: {Path(path).name} ==========")
+                self.stage.emit("Đang chuẩn bị trang...")
+                pages = pipe.prepare_pages(kind, path)
+                self.pages_ready.emit(pages)
+                if self.stop_event.is_set():
+                    ok_all = False
+                    break
+                self.stage.emit("Đang tải model (lần đầu có thể mất vài phút)...")
+                pipe.load_models()
+                self.stage.emit("Đang dịch...")
+                ok = pipe.run(pages, progress=self._prog, page_done=self.page_done.emit)
+                ok_all = ok_all and ok
+            self.finished_ok.emit(ok_all, project_path)
         except Exception:  # noqa: BLE001
             self.log.emit("LỖI:\n" + traceback.format_exc())
             self.finished_ok.emit(False, project_path)
@@ -221,8 +249,10 @@ class MainWindow(QMainWindow):
         self._thumb_queue = []
         self._gpu_text = ""
         self.update_info = None
+        self.queue = []
         self._build_ui()
         self._load_settings()
+        self._setup_shortcuts()
         QTimer.singleShot(400, self._maybe_auto_ollama)  # đang chọn AI + Ollama -> tự kết nối luôn
         self.probe = GpuProbe()
         self.probe.done.connect(self._on_gpu)
@@ -289,7 +319,7 @@ class MainWindow(QMainWindow):
         tr.addWidget(badge, 0, Qt.AlignVCenter)
         tr.addStretch(1)
         tv.addLayout(tr)
-        sub = QLabel(f"by {APP_AUTHOR}  •  Trung · Nhật · Anh  →  Tiếng Việt")
+        sub = QLabel(f"by {APP_AUTHOR}  •  Trung · Nhật · Hàn · Anh  →  Tiếng Việt")
         sub.setObjectName("appSub")
         tv.addWidget(sub)
         h.addLayout(tv)
@@ -325,23 +355,30 @@ class MainWindow(QMainWindow):
 
         # --- 1. nguồn truyện ---
         c = Card("Nguồn truyện", icon="📚")
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        b_folder = QPushButton("📁\nThư mục ảnh")
+        row = QGridLayout()
+        row.setHorizontalSpacing(8)
+        row.setVerticalSpacing(8)
+        b_folder = QPushButton("📁  Thư mục ảnh")
         b_folder.setObjectName("bigSource")
         b_folder.clicked.connect(self.pick_folder)
-        b_pdf = QPushButton("📄\nFile PDF")
+        b_pdf = QPushButton("📄  PDF / CBZ")
         b_pdf.setObjectName("bigSource")
+        b_pdf.setToolTip("File PDF, truyện nén .cbz / .zip")
         b_pdf.clicked.connect(self.pick_pdf)
-        b_proj = QPushButton("🗂\nDự án cũ")
+        b_multi = QPushButton("📚  Nhiều chương")
+        b_multi.setObjectName("bigSource")
+        b_multi.setToolTip("Chọn thư mục chứa nhiều chương (mỗi thư mục con / file PDF / CBZ là 1 chương)\n"
+                           "– dịch lần lượt cả hàng đợi. Kéo thả nhiều thư mục / file vào cửa sổ cũng được.")
+        b_multi.clicked.connect(self.pick_multi)
+        b_proj = QPushButton("🗂  Dự án cũ")
         b_proj.setObjectName("bigSource")
         b_proj.setToolTip("Mở project.json trong thư mục _work để sửa tiếp bản dịch")
         b_proj.clicked.connect(self.open_project)
-        for b in (b_folder, b_pdf, b_proj):
-            b.setMinimumHeight(62)
+        for k, b in enumerate((b_folder, b_pdf, b_multi, b_proj)):
+            b.setMinimumHeight(44)
             b.setMinimumWidth(0)
             b.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            row.addWidget(b)
+            row.addWidget(b, k // 2, k % 2)
         c.add(row)
         self.lbl_source = QLabel("Chưa chọn truyện – hoặc kéo thả vào cửa sổ")
         self.lbl_source.setObjectName("sourceInfo")
@@ -365,8 +402,18 @@ class MainWindow(QMainWindow):
         g.addWidget(field("Ngôn ngữ gốc", self.cb_lang), 0, 0)
         g.addWidget(field("Thiết bị", self.cb_device), 0, 1)
         g.addWidget(field("Bộ dịch", self.cb_engine), 1, 0, 1, 2)
+        self.cb_mode = QComboBox()
+        for t, d in RUN_MODES:
+            self.cb_mode.addItem(t, d)
+        self.cb_mode.setToolTip("Chỉ xoá chữ: xuất bản RAW sạch (không dịch) – nhập kịch bản để lồng chữ sau")
+        self.cb_reading = QComboBox()
+        for t, d in READINGS:
+            self.cb_reading.addItem(t, d)
+        self.cb_reading.setToolTip("Thứ tự đọc các ô thoại trong trang – để AI hiểu đúng mạch truyện")
+        g.addWidget(field("Chế độ", self.cb_mode), 2, 0)
+        g.addWidget(field("Thứ tự đọc", self.cb_reading), 2, 1)
         c.add(g)
-        for cb in (self.cb_lang, self.cb_engine, self.cb_device):
+        for cb in (self.cb_lang, self.cb_engine, self.cb_device, self.cb_mode, self.cb_reading):
             cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumContentsLength(6)
         self.cb_engine.currentIndexChanged.connect(self._engine_changed)
@@ -381,8 +428,12 @@ class MainWindow(QMainWindow):
         b_gl = QPushButton("📖  Thuật ngữ")
         b_gl.setToolTip("Mở bảng thuật ngữ (lưu trong data.db)")
         b_gl.clicked.connect(self.open_glossary)
+        b_pr = QPushButton("👥  Xưng hô")
+        b_pr.setToolTip("Cách các nhân vật gọi nhau (A ↔ B) cho AI dịch đúng vai vế  (F6)")
+        b_pr.clicked.connect(self.open_pronouns)
         gr.addWidget(self.chk_glossary, 1)
         gr.addWidget(b_gl)
+        gr.addWidget(b_pr)
         c.add(gr)
         v.addWidget(c)
 
@@ -469,6 +520,25 @@ class MainWindow(QMainWindow):
         xr.addWidget(self.chk_psd)
         xr.addStretch(1)
         c.add(xr)
+        xr2 = QHBoxLayout()
+        self.chk_cbz = QCheckBox("Đóng gói .cbz")
+        self.chk_cbz.setToolTip("File truyện nén .cbz – đọc bằng Tachiyomi/Mihon, CDisplayEx, Komga...")
+        self.chk_script = QCheckBox("Kịch bản .tsv/.txt")
+        self.chk_script.setChecked(True)
+        self.chk_script.setToolTip("Kịch bản lời thoại – sửa xong nạp lại bằng 🧰 Công cụ → Nhập kịch bản")
+        xr2.addWidget(self.chk_cbz)
+        xr2.addWidget(self.chk_script)
+        xr2.addStretch(1)
+        c.add(xr2)
+        lr = QHBoxLayout()
+        b_logo = QPushButton("🏷  Logo nhóm dịch…")
+        b_logo.setToolTip("Đóng dấu logo / credit nhóm dịch lên trang")
+        b_logo.clicked.connect(self.open_logo)
+        self.lbl_logo = QLabel("")
+        self.lbl_logo.setObjectName("cardHint")
+        lr.addWidget(b_logo)
+        lr.addWidget(self.lbl_logo, 1)
+        c.add(lr)
         v.addWidget(c)
 
         # --- 5. chạy + tiến độ ---
@@ -572,7 +642,21 @@ class MainWindow(QMainWindow):
         g.addWidget(field("Model", mr), 2, 0, 1, 2)
         self.key_field = field("API key", self.ed_llm_key)
         g.addWidget(self.key_field, 3, 0, 1, 2)
-        g.addWidget(field("Văn phong", self.ed_llm_style), 4, 0, 1, 2)
+        b_style = QToolButton()
+        b_style.setText("✨ Mẫu")
+        b_style.setToolTip("Chọn nhanh văn phong theo thể loại truyện")
+        b_style.setPopupMode(QToolButton.InstantPopup)
+        sm = QMenu(b_style)
+        for name, txt in STYLE_PRESETS:
+            act = sm.addAction(name)
+            act.setToolTip(txt)
+            act.triggered.connect(lambda _=False, t=txt: self.ed_llm_style.setText(t))
+        b_style.setMenu(sm)
+        st_row = QHBoxLayout()
+        st_row.setSpacing(6)
+        st_row.addWidget(self.ed_llm_style, 1)
+        st_row.addWidget(b_style)
+        g.addWidget(field("Văn phong", st_row), 4, 0, 1, 2)
         g.addWidget(field("Ghi chú về truyện (nhân vật, quan hệ)", self.ed_llm_notes), 5, 0, 1, 2)
         g.addLayout(tr, 6, 0, 1, 2)
         g.addWidget(self.pull_bar, 7, 0, 1, 2)
@@ -638,9 +722,23 @@ class MainWindow(QMainWindow):
         self.b_retrans.setToolTip("Dịch lại mọi ô bằng bộ dịch đang chọn (vd. sau khi sửa bảng thuật ngữ\n"
                                   "hoặc đổi sang AI) – không đọc chữ / xoá chữ lại")
         self.b_retrans.clicked.connect(self.retranslate)
+        b_tools = QToolButton()
+        b_tools.setText("🧰  Công cụ")
+        b_tools.setPopupMode(QToolButton.InstantPopup)
+        tm = QMenu(b_tools)
+        for text, fn in (("📥  Nhập kịch bản (bản dịch làm sẵn)…\tCtrl+I", self.import_script),
+                         ("🔍  Tìm && thay thế cả chương…\tCtrl+H", self.open_find),
+                         ("☑  Soát lỗi cả chương\tF7", self.open_qc),
+                         ("🪄  Tự sửa dấu câu / khoảng trắng\tF8", self.auto_fix_punct),
+                         ("👥  Xưng hô nhân vật…\tF6", self.open_pronouns),
+                         ("📜  Cắt / ghép webtoon…\tF12", self.open_webtoon),
+                         ("⌨  Phím tắt\tF1", self.show_shortcuts)):
+            tm.addAction(text).triggered.connect(fn)
+        b_tools.setMenu(tm)
         row.addWidget(b_apply)
         row.addWidget(b_redraw_all)
         row.addWidget(self.b_retrans)
+        row.addWidget(b_tools)
         row.addStretch(1)
         ev.addLayout(row)
         split.addWidget(edit)
@@ -653,7 +751,21 @@ class MainWindow(QMainWindow):
         sv.setContentsMargins(8, 8, 8, 8)
         self.lbl_status_tab = QLabel("Chưa có dữ liệu – dịch xong sẽ liệt kê các ô cần xem lại.")
         self.lbl_status_tab.setObjectName("cardHint")
-        sv.addWidget(self.lbl_status_tab)
+        self.lbl_status_tab.setWordWrap(True)
+        qr = QHBoxLayout()
+        qr.addWidget(self.lbl_status_tab, 1)
+        self.cb_qc = QComboBox()
+        self.cb_qc.addItem("Mọi lỗi", 0)
+        self.cb_qc.addItem("❌ Nên sửa trước khi xuất", 1)
+        self.cb_qc.addItem("⚠ Lệch / tràn khung", 2)
+        self.cb_qc.addItem("✎ Kiểm tra lại", 3)
+        self.cb_qc.currentIndexChanged.connect(self._refresh_status)
+        b_fix = QPushButton("🪄  Tự sửa dấu câu")
+        b_fix.setToolTip("Bỏ khoảng trắng thừa, sửa '....' / '!!!!!', thêm cách sau dấu phẩy, viết hoa đầu câu (F8)")
+        b_fix.clicked.connect(self.auto_fix_punct)
+        qr.addWidget(self.cb_qc)
+        qr.addWidget(b_fix)
+        sv.addLayout(qr)
         self.status_table = QTableWidget(0, 4)
         self.status_table.setHorizontalHeaderLabels(["Trang", "Ô", "Vấn đề", "Chữ gốc → bản dịch"])
         self.status_table.verticalHeader().setVisible(False)
@@ -665,7 +777,7 @@ class MainWindow(QMainWindow):
         sh.setSectionResizeMode(3, QHeaderView.Stretch)
         self.status_table.cellDoubleClicked.connect(self._goto_issue)
         sv.addWidget(self.status_table, 1)
-        self.tabs.addTab(stw, "✅  Tình trạng")
+        self.tabs.addTab(stw, "✅  Soát lỗi")
         # --- tab nhật ký ---
         logw = QWidget()
         lv = QVBoxLayout(logw)
@@ -735,6 +847,11 @@ class MainWindow(QMainWindow):
         self.chk_pdf.setChecked(s.get_bool("pdf", True))
         self.chk_xlsx.setChecked(s.get_bool("export_xlsx", True))
         self.chk_psd.setChecked(s.get_bool("export_psd", False))
+        self.chk_cbz.setChecked(s.get_bool("export_cbz", False))
+        self.chk_script.setChecked(s.get_bool("export_script", True))
+        self._set_combo(self.cb_mode, s.value("run_mode", "translate"))
+        self._set_combo(self.cb_reading, s.value("reading", "auto"))
+        self._update_logo_label()
         self._set_combo(self.cb_provider, s.value("llm_provider", "ollama"))
         self._provider_changed()
         self.ed_llm_style.setText(s.value("llm_style", ""))
@@ -757,6 +874,10 @@ class MainWindow(QMainWindow):
         s.setValue("pdf", self.chk_pdf.isChecked())
         s.setValue("export_xlsx", self.chk_xlsx.isChecked())
         s.setValue("export_psd", self.chk_psd.isChecked())
+        s.setValue("export_cbz", self.chk_cbz.isChecked())
+        s.setValue("export_script", self.chk_script.isChecked())
+        s.setValue("run_mode", self.cb_mode.currentData())
+        s.setValue("reading", self.cb_reading.currentData())
         self._store_provider_fields()
         s.setValue("llm_provider", self.cb_provider.currentData())
         s.setValue("llm_style", self.ed_llm_style.text().strip())
@@ -975,7 +1096,18 @@ class MainWindow(QMainWindow):
             img_format=self.cb_fmt.currentText(),
             export_pdf=self.chk_pdf.isChecked(),
             out_dir=self.ed_out.text().strip(),
+            **self._extra_config(),
         )
+
+    def _extra_config(self) -> dict:
+        """Cài đặt dùng chung cho dịch mới và vẽ lại: chế độ, thứ tự đọc, xuất CBZ/kịch bản, logo."""
+        s = self.settings
+        logo_on = s.get_bool("logo_on", False) and Path(s.value("logo_path", "") or "").is_file()
+        return dict(run_mode=self.cb_mode.currentData(), reading=self.cb_reading.currentData(),
+                    export_cbz=self.chk_cbz.isChecked(), export_script=self.chk_script.isChecked(),
+                    logo_path=s.value("logo_path", "") if logo_on else "", logo_pos=s.value("logo_pos", "auto"),
+                    logo_size=s.get_int("logo_size", 12), logo_opacity=s.get_int("logo_opacity", 85),
+                    logo_pages=s.value("logo_pages", "all"), credit=s.value("credit", "") or "")
 
     def _busy(self) -> bool:
         if self.worker and self.worker.isRunning():
@@ -1008,12 +1140,14 @@ class MainWindow(QMainWindow):
     def pick_pdf(self):
         if self._busy():
             return
-        f, _ = QFileDialog.getOpenFileName(self, "Chọn file PDF truyện", self._last_dir(), "PDF (*.pdf)")
+        f, _ = QFileDialog.getOpenFileName(self, "Chọn file truyện (PDF / CBZ / ZIP)", self._last_dir(), SRC_FILTER)
         if f:
             self.load_pdf(f)
 
     def load_pdf(self, f):
         self.settings.setValue("last_dir", str(Path(f).parent))
+        if Path(f).suffix.lower() in ARCHIVE_EXT:
+            return self.load_archive(f)
         try:
             n = pdf_page_count(f)
         except Exception as e:  # noqa: BLE001
@@ -1023,6 +1157,67 @@ class MainWindow(QMainWindow):
         self._set_source_label(f"📄  <b>{Path(f).name}</b><br>{n} trang PDF")
         self.ed_out.setText(str(Path(f).parent / (Path(f).stem + "_VI")))
 
+    def load_archive(self, f):
+        try:
+            n = len(archive_images(f))
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Lỗi file nén", f"Không mở được file:\n{e}")
+            return
+        if not n:
+            QMessageBox.warning(self, "Không có ảnh", "File nén không có ảnh jpg/png/webp nào.")
+            return
+        self._set_source("archive", f, [])
+        self._set_source_label(f"🗜  <b>{Path(f).name}</b><br>{n} trang (truyện nén)")
+        self.ed_out.setText(str(Path(f).parent / (Path(f).stem + "_VI")))
+
+    # ---- hàng đợi nhiều chương ----
+    @staticmethod
+    def _source_of(p: Path):
+        if p.is_dir():
+            return ("folder", str(p)) if list_images(p) else None
+        ext = p.suffix.lower()
+        if ext == ".pdf":
+            return ("pdf", str(p))
+        if ext in ARCHIVE_EXT:
+            return ("archive", str(p))
+        return None
+
+    def pick_multi(self):
+        if self._busy():
+            return
+        d = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa nhiều chương", self._last_dir())
+        if not d:
+            return
+        from core.loader import natural_key
+
+        items = sorted(Path(d).iterdir(), key=lambda x: natural_key(x.name))
+        jobs = [j for j in (self._source_of(x) for x in items) if j]
+        if not jobs and list_images(d):
+            return self.load_folder(d)
+        if not jobs:
+            QMessageBox.warning(self, "Không có chương", "Thư mục không có thư mục con chứa ảnh / file PDF / CBZ nào.")
+            return
+        self.settings.setValue("last_dir", d)
+        self.load_queue(jobs, Path(d))
+
+    def load_queue(self, jobs, parent: Path):
+        if len(jobs) == 1:
+            kind, path = jobs[0]
+            return self.load_folder(path) if kind == "folder" else self.load_pdf(path)
+        kind, path = jobs[0]
+        self._set_source(kind, path, list_images(path) if kind == "folder" else [])
+        self.queue = list(jobs)
+        names = ", ".join(Path(p).name for _k, p in jobs[:4]) + (" …" if len(jobs) > 4 else "")
+        self._set_source_label(f"📚  <b>{len(jobs)} chương</b> trong hàng đợi – dịch lần lượt<br>{names}")
+        self.ed_out.setText(str(parent / (parent.name + "_VI")))
+
+    def _queue_jobs(self, out_base: str):
+        """[(loại, đường dẫn, thư mục kết quả)] – mỗi chương 1 thư mục con trong thư mục kết quả."""
+        if not getattr(self, "queue", None):
+            return None
+        return [(k, p, str(Path(out_base) / (Path(p).stem if k != "folder" else Path(p).name)))
+                for k, p in self.queue]
+
     def _set_source_label(self, html):
         self.lbl_source.setText(html)
         self.lbl_source.setProperty("filled", True)
@@ -1030,6 +1225,7 @@ class MainWindow(QMainWindow):
         self.lbl_source.style().polish(self.lbl_source)
 
     def _set_source(self, kind, path, pages):
+        self.queue = []
         self.source_type, self.source_path = kind, path
         self.src_pages, self.done_pages = pages, {}
         self.project, self.project_path = None, None
@@ -1046,8 +1242,16 @@ class MainWindow(QMainWindow):
         urls = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
         if not urls:
             return
+        if len(urls) > 1:
+            from core.loader import natural_key
+
+            jobs = [j for j in (self._source_of(Path(u)) for u in sorted(urls, key=natural_key)) if j]
+            if len(jobs) > 1:
+                return self.load_queue(jobs, Path(jobs[0][1]).parent)
         p = Path(urls[0])
-        if p.is_dir():
+        if p.suffix.lower() in ARCHIVE_EXT:
+            self.load_archive(str(p))
+        elif p.is_dir():
             self.load_folder(str(p))
         elif p.suffix.lower() == ".pdf":
             self.load_pdf(str(p))
@@ -1136,7 +1340,9 @@ class MainWindow(QMainWindow):
         if not cfg.out_dir:
             QMessageBox.information(self, "Thiếu thư mục", "Hãy chọn thư mục kết quả.")
             return
-        if self.source_type == "folder" and Path(cfg.out_dir).resolve() == Path(self.source_path).resolve():
+        jobs = self._queue_jobs(cfg.out_dir)
+        if self.source_type == "folder" and not jobs and \
+                Path(cfg.out_dir).resolve() == Path(self.source_path).resolve():
             QMessageBox.warning(self, "Thư mục kết quả",
                                 "Thư mục kết quả phải khác thư mục ảnh gốc (tránh ghi đè ảnh gốc).")
             return
@@ -1156,7 +1362,9 @@ class MainWindow(QMainWindow):
         self._t_start = None
         self.log_box.clear()
         self.tabs.setTabText(TAB_LOG, "📜  Nhật ký")
-        self.worker = Worker(cfg, self.source_type, self.source_path, api_key=self.ed_llm_key.text().strip())
+        self.worker = Worker(cfg, self.source_type, self.source_path, api_key=self.ed_llm_key.text().strip(),
+                             jobs=jobs)
+        self.worker.chapter.connect(self._on_chapter)
         self._wire_worker()
         self.worker.start()
 
@@ -1223,8 +1431,14 @@ class MainWindow(QMainWindow):
         self.lbl_progress.setText(txt)
         self.setWindowTitle(f"[{pct:.0f}%] {self.base_title}")
 
+    def _on_chapter(self, k, n, name):
+        self.done_pages = {}
+        self.lbl_status.setText(f"📚 Chương {k}/{n}: {name}")
+        self.setWindowTitle(f"[{k}/{n}] {self.base_title}")
+
     def _on_pages_ready(self, pages):
         self.src_pages = list(pages)
+        self.done_pages = {}
         self._fill_page_list()
 
     def _on_page_done(self, i, page):
@@ -1335,10 +1549,16 @@ class MainWindow(QMainWindow):
         self._save_settings()
         font, upper, scale = self._font_path(), self.chk_upper.isChecked(), self.sl_scale.value()
         ok = True
+        cfg = self.project.setdefault("config", {})
+        extra = self._extra_config()
+        extra.pop("run_mode")  # giữ chế độ của dự án (bản RAW sạch thì ô trống vẫn sạch)
+        extra.pop("reading")
+        cfg.update(extra)
+        total = len(self.project["pages"])
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             for p in pages:
-                rerender_page(p, font, upper, scale)
+                rerender_page(p, font, upper, scale, cfg, total)
                 self.done_pages[p["index"]] = p
                 self._refresh_item(p["index"])
             self.project["config"]["font_path"] = font
@@ -1389,8 +1609,10 @@ class MainWindow(QMainWindow):
         self.chk_upper.setChecked(cfg.uppercase)
         self.sl_scale.setValue(int(cfg.font_scale))
         self.chk_pdf.setChecked(cfg.export_pdf)
+        self._set_combo(self.cb_reading, cfg.reading)
         self.ed_out.setText(str(Path(f).parent.parent))
         self.source_type, self.source_path = None, None
+        self.queue = []
         self._set_source_label(f"🗂  <b>Dự án: {proj.get('source', '')}</b><br>{len(self.done_pages)} trang đã dịch")
         self._fill_page_list()
         self._refresh_status()
@@ -1420,37 +1642,48 @@ class MainWindow(QMainWindow):
         self._wire_worker()
         self.worker.start()
 
+    def _qc_terms(self):
+        if not self.chk_glossary.isChecked():
+            return []
+        try:
+            from core.store import Glossary
+
+            lang = (self.project or {}).get("config", {}).get("src_lang") or self.cb_lang.currentData()
+            return Glossary().terms_for(lang)
+        except Exception:  # noqa: BLE001
+            return []
+
     def _refresh_status(self):
-        """Tab Tình trạng: liệt kê ô chưa dịch / chữ tràn khung để xem lại nhanh."""
-        rows = []
+        """Tab Soát lỗi: chạy bộ soát lỗi cả chương (chưa dịch, còn chữ gốc, tràn khung, dấu câu...)."""
+        from core.script import QC_CODES, qc_check
+
         pages = sorted(self.done_pages.values(), key=lambda p: p["index"])
-        total = 0
-        for p in pages:
-            for k, b in enumerate(p.get("blocks", [])):
-                total += 1
-                if b.get("keep"):
-                    continue
-                if not b.get("translation"):
-                    rows.append((p["index"], k, "❌ Chưa dịch", b.get("text", "")))
-                elif b.get("overflow"):
-                    rows.append((p["index"], k, "⚠ Chữ tràn khung", f"{b.get('text', '')}  →  {b['translation']}"))
+        total = sum(len(p.get("blocks", [])) for p in pages)
+        issues = qc_check({"pages": pages}, self._qc_terms()) if pages else []
+        grp = self.cb_qc.currentData() if hasattr(self, "cb_qc") else 0
+        shown = [x for x in issues if not grp or QC_CODES[x[2]][0] == grp]
         self.status_table.setRowCount(0)
-        for r, (pi, k, what, txt) in enumerate(rows):
+        for r, (pi, k, code, txt) in enumerate(shown):
             self.status_table.insertRow(r)
-            for c, val in enumerate((str(pi + 1), str(k + 1), what, txt)):
+            for c, val in enumerate((str(pi + 1), str(k + 1), QC_CODES[code][1], txt)):
                 it = QTableWidgetItem(val)
                 it.setData(Qt.UserRole, (pi, k))
+                if c == 2:
+                    it.setToolTip(code)
                 self.status_table.setItem(r, c, it)
+        n_block = len({(pi, k) for pi, k, _c, _t in issues})
         if not pages:
             self.lbl_status_tab.setText("Chưa có dữ liệu – dịch xong sẽ liệt kê các ô cần xem lại.")
-            self.tabs.setTabText(TAB_STATUS, "✅  Tình trạng")
-        elif rows:
-            self.lbl_status_tab.setText(f"{len(rows)}/{total} ô cần xem lại – bấm đúp để mở đúng trang, "
-                                        "sửa bản dịch (rút gọn câu dài) rồi bấm Lưu.")
-            self.tabs.setTabText(TAB_STATUS, f"⚠  Tình trạng ({len(rows)})")
+            self.tabs.setTabText(TAB_STATUS, "✅  Soát lỗi")
+        elif issues:
+            n1 = sum(1 for x in issues if QC_CODES[x[2]][0] == 1)
+            self.lbl_status_tab.setText(
+                f"{len(issues)} lỗi ở {n_block}/{total} ô ({n1} nên sửa trước khi xuất) – bấm đúp để mở đúng ô, "
+                "sửa bản dịch rồi bấm Lưu (Ctrl+S). Lỗi dấu câu: bấm 🪄 Tự sửa.")
+            self.tabs.setTabText(TAB_STATUS, f"⚠  Soát lỗi ({len(issues)})")
         else:
-            self.lbl_status_tab.setText(f"✅ Tốt – {total} ô đều đã dịch và vừa khung.")
-            self.tabs.setTabText(TAB_STATUS, "✅  Tình trạng")
+            self.lbl_status_tab.setText(f"✅ Tốt – {total} ô đều đã dịch, vừa khung, không thấy lỗi.")
+            self.tabs.setTabText(TAB_STATUS, "✅  Soát lỗi")
 
     def _goto_issue(self, row, _col):
         it = self.status_table.item(row, 0)
@@ -1463,6 +1696,111 @@ class MainWindow(QMainWindow):
         if k < self.table.rowCount():
             self.table.selectRow(k)
             self.table.scrollToItem(self.table.item(k, 4))
+
+    # ---------------- công cụ ----------------
+    def _need_project(self) -> bool:
+        if self._busy():
+            return False
+        if not self.project or not self.project_path:
+            QMessageBox.information(self, "Chưa có bản dịch", "Hãy dịch một truyện (hoặc mở Dự án cũ) trước.")
+            return False
+        return True
+
+    def _pages_by_index(self, idxs):
+        want = set(idxs)
+        return [p for p in self.project["pages"] if p["index"] in want]
+
+    def open_pronouns(self):
+        PronounDialog(self).exec()
+
+    def open_logo(self):
+        if LogoDialog(self, self.settings).exec():
+            self._update_logo_label()
+            if self.project and QMessageBox.question(
+                    self, "Logo", "Vẽ lại tất cả trang để áp dụng logo?") == QMessageBox.Yes:
+                self.redraw_all()
+
+    def _update_logo_label(self):
+        s = self.settings
+        on = s.get_bool("logo_on", False) and Path(s.value("logo_path", "") or "").is_file()
+        self.lbl_logo.setText(f"✅ {Path(s.value('logo_path')).name}" if on else "Tắt")
+
+    def import_script(self):
+        if not self._need_project():
+            return
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Nhập kịch bản (bản dịch làm sẵn)", str(Path(self.project_path).parent.parent),
+            "Kịch bản (*.xlsx *.tsv *.csv *.txt *.md *.json *.docx);;Tất cả (*.*)")
+        if not f:
+            return
+        from core.script import apply_script, read_script
+
+        try:
+            entries = read_script(f)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Lỗi kịch bản", f"Không đọc được file:\n{e}")
+            return
+        if not entries:
+            QMessageBox.warning(self, "Kịch bản trống", "Không tìm thấy câu dịch nào trong file.")
+            return
+        keyed = sum(1 for pg, bx, _t in entries if pg is not None and bx is not None)
+        how = ("theo đúng số trang / số ô" if keyed == len(entries)
+               else "lần lượt theo thứ tự đọc (bỏ qua ô 'Giữ')")
+        n_blocks = sum(len(p["blocks"]) for p in self.project["pages"])
+        if QMessageBox.question(self, "Nhập kịch bản",
+                                f"Đọc được {len(entries)} câu – sẽ điền {how}.\nChương có {n_blocks} ô.\n\n"
+                                "Bản dịch hiện tại của các ô này sẽ bị thay. Tiếp tục?") != QMessageBox.Yes:
+            return
+        changed, touched = apply_script(self.project, entries)
+        if touched:
+            self._redraw(self._pages_by_index(touched))
+        self.lbl_status.setText(f"📥 Đã nhập kịch bản: đổi {changed} ô trên {len(touched)} trang.")
+        self.log(f"Nhập kịch bản {Path(f).name}: đổi {changed} ô trên {len(touched)} trang")
+
+    def open_find(self):
+        if not self._need_project():
+            return
+        FindReplaceDialog(self, self.project, lambda touched: self._redraw(self._pages_by_index(touched))).exec()
+
+    def open_qc(self):
+        self._refresh_status()
+        self.tabs.setCurrentIndex(TAB_STATUS)
+
+    def auto_fix_punct(self):
+        if not self._need_project():
+            return
+        from core.script import auto_fix
+
+        n, touched = auto_fix(self.project)
+        if not n:
+            self.lbl_status.setText("🪄 Không có lỗi dấu câu nào cần sửa.")
+            self._refresh_status()
+            return
+        self._redraw(self._pages_by_index(touched))
+        self.lbl_status.setText(f"🪄 Đã tự sửa dấu câu {n} ô trên {len(touched)} trang.")
+
+    def open_webtoon(self):
+        if not self._need_project():
+            return
+        WebtoonDialog(self, self.project, str(Path(self.project_path).parent.parent)).exec()
+
+    def show_shortcuts(self):
+        ShortcutsDialog(self).exec()
+
+    def _nav_page(self, step):
+        n = self.page_list.count()
+        if n:
+            self.page_list.setCurrentRow(max(0, min(n - 1, self.page_list.currentRow() + step)))
+
+    def _setup_shortcuts(self):
+        for keys, fn in (("Ctrl+O", self.pick_folder), ("Ctrl+Shift+O", self.pick_pdf),
+                         ("Ctrl+Return", self.start), ("Ctrl+Enter", self.start),
+                         ("Ctrl+S", self.apply_edits), ("Ctrl+Shift+S", self.redraw_all),
+                         ("Alt+Left", lambda: self._nav_page(-1)), ("Alt+Right", lambda: self._nav_page(1)),
+                         ("Ctrl+H", self.open_find), ("Ctrl+F", self.open_find), ("Ctrl+I", self.import_script),
+                         ("F6", self.open_pronouns), ("F7", self.open_qc), ("F8", self.auto_fix_punct),
+                         ("F12", self.open_webtoon), ("F1", self.show_shortcuts)):
+            QShortcut(QKeySequence(keys), self, activated=fn)
 
     def open_out(self):
         d = self.ed_out.text().strip()

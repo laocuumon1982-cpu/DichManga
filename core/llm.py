@@ -15,7 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-LANG_VI = {"zh": "tiếng Trung", "zh_tw": "tiếng Trung (phồn thể)", "ja": "tiếng Nhật", "en": "tiếng Anh"}
+LANG_VI = {"zh": "tiếng Trung", "zh_tw": "tiếng Trung (phồn thể)", "ja": "tiếng Nhật", "ko": "tiếng Hàn", "en": "tiếng Anh"}
 KIND_HINT = {"thought": "suy nghĩ", "shout": "hét", "narration": "dẫn truyện", "sfx": "tượng thanh", "free": "chữ trên hình"}
 
 # id: (tên hiển thị, URL mặc định, model mặc định, cần API key?, kiểu API)

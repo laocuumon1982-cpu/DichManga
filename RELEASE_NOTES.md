@@ -1,6 +1,6 @@
-## Dịch Truyện Tranh v2.1.3 by Duy Anh
+## Dịch Truyện Tranh v2.2.0 by Duy Anh
 
-Dịch truyện tranh **Trung · Nhật · Anh → Tiếng Việt**, chạy trên máy (GPU NVIDIA hoặc CPU).
+Dịch truyện tranh **Trung · Nhật · Hàn · Anh → Tiếng Việt**, chạy trên máy (GPU NVIDIA hoặc CPU).
 
 ### ⬇️ Chọn bản tải
 | Bản | File | Máy |
@@ -11,6 +11,21 @@ Dịch truyện tranh **Trung · Nhật · Anh → Tiếng Việt**, chạy trê
 - **Bản GPU**: tải **tất cả** các phần `.7z.00x` vào cùng thư mục → chuột phải file **`.7z.001`** → 7-Zip → *Extract Here*.
 - Mở **`DichTruyenTranh.exe`**. Lần đầu dịch app tự tải model (cần Internet).
 - `DichTruyenTranh_app_update.zip` là gói cho nút **Cập nhật** trong app – không cần tải tay.
+
+### ✨ v2.2.0 – Manhwa tiếng Hàn, nhiều chương, kịch bản, soát lỗi, logo nhóm dịch
+- **🇰🇷 Tiếng Hàn (manhwa)**: đọc chữ Hàn, dịch bằng NLLB-200 (chạy trên máy), GTX hoặc AI. Chọn **thứ tự đọc** ô thoại: tự động / phải → trái (manga) / trái → phải (manhwa, comic).
+- **📚 Dịch nhiều chương một lượt**: nút *Nhiều chương* (chọn thư mục chứa các chương) hoặc kéo thả nhiều thư mục / file vào cửa sổ – app dịch lần lượt, mỗi chương một thư mục kết quả.
+- **🗜 Truyện nén .cbz / .zip**: mở trực tiếp, và **đóng gói kết quả thành .cbz** (đọc bằng Tachiyomi/Mihon, CDisplayEx, Komga…).
+- **👥 Xưng hô nhân vật** (F6): khai báo từng cặp A ↔ B (A xưng gì, gọi B là gì…), có sẵn mẫu *Anh – Em, Ta – Ngươi, Sư phụ – Đồ nhi, Tớ – Cậu…* → AI dịch đúng vai vế cả chương.
+- **✨ Mẫu văn phong** cho AI theo thể loại: tiên hiệp, học đường, shounen, manhwa hiện đại, ngôn tình, kinh dị, hài.
+- **📥 Kịch bản**: tự xuất `_kich_ban.tsv` / `_kich_ban.txt`; **nhập kịch bản** (bản dịch làm sẵn hoặc nhóm dịch sửa) từ Excel, TSV, CSV, TXT, Word (.docx), JSON → tự điền vào đúng ô và vẽ lại (Ctrl+I).
+- **🧽 Chế độ Chỉ xoá chữ**: xuất bản RAW sạch (không dịch) – sau đó nhập kịch bản để lồng chữ.
+- **☑ Soát lỗi cả chương** (F7): 10 loại lỗi – chưa dịch, còn chữ gốc, AI trả thừa chữ, tràn khung, câu quá dài, dấu câu, lặp từ, thuật ngữ chưa đúng bảng, ngoặc lẻ… lọc theo mức độ, bấm đúp mở đúng ô. **🪄 Tự sửa dấu câu** (F8).
+- **🔍 Tìm & thay thế cả chương** (Ctrl+H): khớp trọn từ, phân biệt hoa/thường, regex, xem trước từng ô rồi mới thay.
+- **🏷 Logo nhóm dịch**: đóng dấu logo PNG lên mọi trang / trang đầu / trang cuối, tự chọn góc trống không đè bóng thoại; tên nhóm ghi vào file .cbz.
+- **📜 Cắt / ghép webtoon** (F12): ghép thành 1 ảnh dài, hoặc cắt lại theo chiều cao chọn – **không bao giờ cắt ngang bóng thoại**.
+- **⌨ Phím tắt** (F1): Ctrl+S lưu & vẽ lại, Alt+←/→ chuyển trang, Ctrl+Enter bắt đầu dịch…
+- Tải model xoá chữ LaMa **tải tiếp được** khi bị ngắt mạng giữa chừng.
 
 ### ⚡ v2.1.3 – AI dịch không còn "đứng" ở 45%
 - Thanh tiến độ **chạy liên tục trong lúc AI đang viết** (hiện số ký tự đã viết, tốc độ ký tự/giây), không còn đứng yên ở 45%.

@@ -3,6 +3,7 @@
 Dùng np.fromfile + cv2.imdecode để đọc được đường dẫn có dấu tiếng Việt trên Windows.
 """
 import re
+import shutil
 from pathlib import Path
 
 import cv2
@@ -139,3 +140,68 @@ def export_pdf(image_paths, pdf_path, quality: int = 90) -> None:
     data = doc.tobytes(garbage=3, deflate=True)
     doc.close()
     Path(pdf_path).write_bytes(data)
+
+
+# ---------------- truyện nén .cbz / .zip ----------------
+ARCHIVE_EXT = {".cbz", ".zip"}
+
+
+def archive_images(path) -> list:
+    """Tên các ảnh trong file .cbz/.zip theo thứ tự tự nhiên (kể cả trong thư mục con)."""
+    import zipfile
+
+    with zipfile.ZipFile(str(path)) as z:
+        names = [n for n in z.namelist()
+                 if not n.endswith("/") and Path(n).suffix.lower() in IMG_EXT
+                 and not Path(n).name.startswith(".") and "__MACOSX" not in n]
+    names.sort(key=natural_key)
+    return names
+
+
+def extract_archive(path, out_dir, log=print, stop_event=None) -> list:
+    """Giải nén ảnh trong .cbz/.zip ra out_dir với tên mới 0001.jpg... (không dùng đường dẫn
+    trong file nén -> không sợ file nén độc ghi ra ngoài thư mục)."""
+    import zipfile
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("*"):
+        if old.is_file():
+            old.unlink()
+    names = archive_images(path)
+    paths = []
+    with zipfile.ZipFile(str(path)) as z:
+        for i, n in enumerate(names):
+            if stop_event is not None and stop_event.is_set():
+                break
+            p = out_dir / f"{i + 1:04d}{Path(n).suffix.lower()}"
+            with z.open(n) as src, open(p, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+            paths.append(str(p))
+    log(f"  Đã giải nén {len(paths)} trang từ {Path(path).name}")
+    return paths
+
+
+def export_cbz(image_paths, cbz_path, title: str = "", credit: str = "") -> int:
+    """Đóng gói các trang đã dịch thành .cbz (đọc được bằng CDisplayEx, Tachiyomi/Mihon, Komga...)."""
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    from . import APP_NAME, APP_VERSION
+
+    cbz_path = Path(cbz_path)
+    cbz_path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    tmp = cbz_path.with_suffix(".tmp")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+        for i, p in enumerate(image_paths):
+            if p and Path(p).is_file():
+                z.write(p, f"{i + 1:04d}{Path(p).suffix.lower()}")
+                n += 1
+        info = ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ComicInfo>\n"
+                f"  <Title>{escape(title)}</Title>\n  <LanguageISO>vi</LanguageISO>\n  <PageCount>{n}</PageCount>\n"
+                + (f"  <Translator>{escape(credit)}</Translator>\n" if credit else "")
+                + f"  <Notes>{escape(f'Dịch bằng {APP_NAME} v{APP_VERSION}')}</Notes>\n</ComicInfo>\n")
+        z.writestr("ComicInfo.xml", info)
+    tmp.replace(cbz_path)
+    return n

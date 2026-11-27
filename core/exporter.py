@@ -1,4 +1,4 @@
-"""Xuất kết quả: ban_dich.txt, PDF gộp, Excel lời thoại, PSD 3 lớp (gốc / nền sạch / chữ)."""
+"""Xuất kết quả: ban_dich.txt, kịch bản .tsv/.txt, PDF gộp, CBZ, Excel lời thoại, PSD 3 lớp."""
 from pathlib import Path
 
 from .block import TextBlock
@@ -112,6 +112,23 @@ def export_extras(project: dict, out_dir, cfg, log=print) -> None:
             log(f"Đã xuất PDF: {name}_vi.pdf")
         except Exception as e:  # noqa: BLE001
             log(f"! Xuất PDF lỗi: {e}")
+    if _cfg(cfg, "export_script", True):
+        try:
+            from .script import export_script_txt, export_tsv
+
+            export_tsv(project, out_dir / f"{name}_kich_ban.tsv")
+            export_script_txt(project, out_dir / f"{name}_kich_ban.txt")
+        except Exception as e:  # noqa: BLE001
+            log(f"! Xuất kịch bản lỗi: {e}")
+    if _cfg(cfg, "export_cbz", False):
+        try:
+            from .loader import export_cbz
+
+            n = export_cbz([p["out"] for p in project["pages"]], out_dir / f"{name}_vi.cbz", name,
+                           _cfg(cfg, "credit", ""))
+            log(f"Đã đóng gói {n} trang: {name}_vi.cbz")
+        except Exception as e:  # noqa: BLE001
+            log(f"! Xuất CBZ lỗi: {e}")
     if _cfg(cfg, "export_xlsx", True):
         try:
             n = export_xlsx(project, out_dir / f"{name}_loi_thoai.xlsx")
